@@ -6,11 +6,12 @@
 //! # Examples
 //!
 //! ```rust
-//! use some_crate::BackupManager;
+//! use obsidian_backup_system::BackupManager;
 //!
-//! let store_dir = "/path/to/store_directory";
-//! let working_dir = "/path/to/working_directory";
-//! let backup_manager = BackupManager::new(store_dir, working_dir).unwrap();
+//! let store_dir = "./backup_store";
+//! let working_dir = "./my_data";
+//! let backup_manager = BackupManager::new(store_dir, working_dir)
+//!     .expect("Failed to initialize BackupManager");
 //! ```
 //!
 //! # Fields
@@ -23,6 +24,7 @@ use anyhow::Result;
 use git2::{Oid, Repository, RepositoryInitOptions};
 #[cfg(feature = "zip")]
 use sevenz_rust2::{ArchiveWriter, encoder_options};
+use std::fs;
 use std::path::Path;
 
 /// `BackupManager` is a struct responsible for managing backup operations.
@@ -36,14 +38,47 @@ use std::path::Path;
 ///
 /// # Example
 /// ```rust
-/// let repository = Repository::new();
-/// let backup_manager = BackupManager { repository };
+/// use obsidian_backup_system::BackupManager;
+/// 
+/// let backup_manager = BackupManager::new("./backup_store", "./my_data")
+///     .expect("Failed to create BackupManager");
 /// ```
 pub struct BackupManager {
     repository: Repository,
 }
 
 impl BackupManager {
+    /// Helper function to recursively add files from a directory to the git index
+    fn add_directory_to_index(
+        &self,
+        index: &mut git2::Index,
+        dir_path: &Path,
+        base_path: &Path,
+    ) -> Result<()> {
+        for entry in fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            // Skip .git files and directories
+            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                continue;
+            }
+
+            let file_type = entry.file_type()?;
+
+            if file_type.is_dir() {
+                // Recursively add subdirectory
+                self.add_directory_to_index(index, &path, base_path)?;
+            } else if file_type.is_file() {
+                // Calculate relative path from base_path
+                let relative_path = path.strip_prefix(base_path)?;
+                debug!("Adding file to index: {:?}", relative_path);
+                index.add_path(relative_path)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Creates a new instance of `BackupManager`.
     ///
     /// This function initializes a `BackupManager` by setting up a new Git repository
@@ -75,7 +110,9 @@ impl BackupManager {
     /// # Example
     ///
     /// ```
-    /// let manager = BackupManager::new("/path/to/store", "/path/to/working")
+    /// use obsidian_backup_system::BackupManager;
+    /// 
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
     /// ```
     ///
@@ -85,11 +122,22 @@ impl BackupManager {
         working_directory: impl AsRef<Path>,
     ) -> Result<Self> {
         info!("Initializing BackupManager");
-        let store_directory = store_directory.as_ref().to_path_buf();
-        let working_directory = working_directory.as_ref().to_path_buf();
 
-        debug!("Store directory: {:?}", store_directory);
-        debug!("Working directory: {:?}", working_directory);
+        // Convert to absolute paths to avoid path resolution issues
+        let store_directory = if store_directory.as_ref().is_absolute() {
+            store_directory.as_ref().to_path_buf()
+        } else {
+            std::env::current_dir()?.join(store_directory.as_ref())
+        };
+
+        let working_directory = if working_directory.as_ref().is_absolute() {
+            working_directory.as_ref().to_path_buf()
+        } else {
+            std::env::current_dir()?.join(working_directory.as_ref())
+        };
+
+        debug!("Store directory (absolute): {:?}", store_directory);
+        debug!("Working directory (absolute): {:?}", working_directory);
 
         let mut opts = RepositoryInitOptions::new();
         opts.workdir_path(&working_directory);
@@ -130,8 +178,12 @@ impl BackupManager {
     ///
     /// # Example
     /// ```
-    /// // Assuming `self` is an object with access to a repository.
-    /// match self.list() {
+    /// use obsidian_backup_system::BackupManager;
+    /// 
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    /// 
+    /// match manager.list() {
     ///     Ok(backup_items) => {
     ///         for item in backup_items {
     ///             println!("Backup ID: {}, Timestamp: {}, Description: {}",
@@ -156,7 +208,6 @@ impl BackupManager {
         let ids = self.list_ids()?;
         debug!("Found {} commit IDs", ids.len());
 
-        let mut count = 0;
         for commit_id in ids {
             debug!("Processing commit: {}", commit_id);
             let commit = self.repository.find_commit(Oid::from_str(&commit_id)?)?;
@@ -174,10 +225,9 @@ impl BackupManager {
                 item.id, item.timestamp, item.description
             );
             items.push(item);
-            count += 1;
         }
 
-        info!("Found {} backup items", count);
+        info!("Found {} backup items", items.len());
         Ok(items)
     }
 
@@ -227,9 +277,13 @@ impl BackupManager {
     /// # Example
     ///
     /// ```rust
-    /// let repo_manager = RepositoryManager::new("/path/to/repository").unwrap();
+    /// use obsidian_backup_system::BackupManager;
+    /// 
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    /// 
     /// let description = Some("Backup before deployment".to_string());
-    /// match repo_manager.create_backup(description) {
+    /// match manager.backup(description) {
     ///     Ok(commit_id) => println!("Backup created with ID: {}", commit_id),
     ///     Err(e) => eprintln!("Failed to create backup: {}", e),
     /// }
@@ -246,8 +300,20 @@ impl BackupManager {
         debug!("Getting repository index");
         let mut index = self.repository.index()?;
 
-        debug!("Adding all files to index");
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+        // Get the working directory
+        let workdir = self
+            .repository
+            .workdir()
+            .ok_or_else(|| anyhow::anyhow!("Repository has no working directory"))?;
+
+        debug!("Working directory: {:?}", workdir);
+
+        // Clear the index first to handle deleted files
+        debug!("Clearing index");
+        index.clear()?;
+
+        debug!("Adding all files from working directory to index");
+        self.add_directory_to_index(&mut index, workdir, workdir)?;
 
         debug!("Writing index");
         index.write()?;
@@ -347,9 +413,13 @@ impl BackupManager {
     /// # Example Usage
     ///
     /// ```no_run
-    /// let repo = MyRepository::new();
-    ///
-    /// if let Err(err) = repo.restore_backup("abcdef1234567890") {
+    /// use obsidian_backup_system::BackupManager;
+    /// 
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    /// 
+    /// let backup_id = "abcdef1234567890";
+    /// if let Err(err) = manager.restore(backup_id) {
     ///     eprintln!("Failed to restore backup: {}", err);
     /// } else {
     ///     println!("Backup restored successfully!");
@@ -424,13 +494,17 @@ impl BackupManager {
     ///
     /// ```rust
     /// use obsidian_backup_system::BackupManager;
-    /// ...
-    /// let manager:BackupManager; // Assume this is initialized properly
+    /// 
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    /// 
     /// let last_backup = manager
-    ///    .last()
-    ///    .expect("Failed to get last backup")
-    ///    .expect("No backups found");
-    /// manager.export(last_backup.id, "exported.zip", 0).expect("Failed to export backup");
+    ///     .last()
+    ///     .expect("Failed to get last backup")
+    ///     .expect("No backups found");
+    /// 
+    /// manager.export(&last_backup.id, "backup.7z", 5)
+    ///     .expect("Failed to export backup");
     /// ```
     ///
     /// In this example, the specified backup ID is packed into a `.7z` archive
@@ -504,9 +578,14 @@ impl BackupManager {
     /// # Example
     ///
     /// ```rust
-    /// let repo = Repository::open("/path/to/repo")?;
-    /// let analyzer = RepoAnalyzer::new(repo);
-    /// let modified_files = analyzer.modified_files("abcd1234")?;
+    /// use obsidian_backup_system::BackupManager;
+    /// 
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    /// 
+    /// let backup_id = "abcd1234";
+    /// let modified_files = manager.diff(backup_id)
+    ///     .expect("Failed to get diff");
     ///
     /// for file in modified_files {
     ///     println!("Path: {}", file.path);
@@ -642,72 +721,6 @@ impl BackupManager {
         }
     }
 
-    /// Recursively adds the contents of a Git tree to an archive.
-    ///
-    /// This function traverses a Git tree and adds its files and directories to the specified
-    /// archive writer. Files (blobs in Git) are added as individual entries, while directories
-    /// (sub-trees in Git) are recursively processed to include their contents.
-    ///
-    /// # Arguments
-    ///
-    /// * `writer` - A mutable reference to an `ArchiveWriter` object for writing the archive.
-    ///              The writer is used to push entries (files and directories) into the archive.
-    /// * `tree` - A reference to the `git2::Tree` object representing the Git tree to add.
-    ///              The tree contains references to files and subdirectories.
-    /// * `path_prefix` - A `&str` representing the prefix path inside the archive for the current tree.
-    ///                   This is used to maintain the directory structure within the archive.
-    ///
-    /// # Returns
-    ///
-    /// A `Result<()>` which is:
-    /// - `Ok(())` if all files and directories were successfully added to the archive.
-    /// - An `Err` if any errors occurred while processing files or directories (e.g., reading blobs
-    ///   or writing to the archive).
-    ///
-    /// # Behavior
-    ///
-    /// - Files (blobs) within the tree are added directly to the archive with their content.
-    /// - Subdirectories (trees) are recursively processed, preserving the directory structure
-    ///   in the archive.
-    /// - Non-standard or unsupported Git object types (e.g., commits or tags) are skipped with a debug
-    ///   message logged indicating their presence.
-    ///
-    /// # Debugging
-    ///
-    /// This function logs debug messages using the `debug!` macro:
-    /// - When a file is added to the archive.
-    /// - When entering into a directory for recursive processing.
-    /// - When skipping unsupported Git object types.
-    ///
-    /// # Dependencies
-    ///
-    /// This function requires the following external libraries:
-    /// - `git2`: For working with Git trees, blobs, and related object types.
-    /// - `sevenz_rust2`: For creating and adding entries to the archive.
-    /// - A logger compatible with the `debug!` macro for debugging messages.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use git2::{Repository, Tree};
-    /// use sevenz_rust2::ArchiveWriter;
-    /// use std::fs::File;
-    ///
-    /// fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let repo = Repository::open(".")?;
-    ///     let tree = repo.find_reference("HEAD")?
-    ///         .peel_to_tree()?;
-    ///
-    ///     let archive_file = File::create("archive.7z")?;
-    ///     let mut archive_writer = ArchiveWriter::new(archive_file);
-    ///
-    ///     // Create an instance of the struct containing `add_tree_to_archive` (not shown here).
-    ///     let instance = MyStruct::new(repo);
-    ///     instance.add_tree_to_archive(&mut archive_writer, &tree, "")?;
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
     #[cfg(feature = "zip")]
     fn add_tree_to_archive(
         &self,
