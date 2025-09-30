@@ -9,23 +9,26 @@ license = "MIT"
 [[bin]]
 name = "obackup"
 path = "src/cli/mod.rs"
-required-features = ["cli", "serde", "logging"]
+required-features = ["cli", "serde", "logging", "zip"]
 
 
 [dependencies]
-git2 = { version = "0.20.2" }
+git2 = { version = ">=0.20" }
 serde = { version = "*", optional = true, features = ["derive", "serde_derive"] }
 clap = { version = ">=4", optional = true, features = ["derive", "usage", "suggestions", "error-context", "help", "string", "wrap_help", "color", "unicode"] }
-tokio = { version = ">=1", features = ["io-util", "fs", "sync", "macros", "rt", "time", "signal"] }
 anyhow = { version = ">=1", features = ["backtrace"] }
-thiserror = ">=1"
 serde_json = { version = "*", optional = true }
 log = { version = ">=0.4", optional = true }
-pretty_env_logger = { version = "0.5.0", optional = true }
-sevenz-rust2 = { version = "0.19.1" }
+pretty_env_logger = { version = "*", optional = true }
+sevenz-rust2 = { version = ">=0.19", optional = true }
 chrono = { version = "*", features = ["serde"] }
 
 [features]
+# This will build the CLI application
 cli = ["dep:clap", "dep:serde_json", "dep:pretty_env_logger"]
+# This will enable serialization/deserialization support
 serde = ["dep:serde"]
+# This will enable logging support
 logging = ["dep:log"]
+# This will enable support for exporting backups as 7z archives
+zip = ["dep:sevenz-rust2"]
