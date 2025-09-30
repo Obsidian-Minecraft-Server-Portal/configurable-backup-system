@@ -17,12 +17,13 @@
 //!
 //! * `repository` - The Git repository used for managing backups.
 use crate::data::backup_item::BackupItem;
+use crate::data::modified_file::ModifiedFile;
 use crate::log_stub::*;
 use anyhow::Result;
 use git2::{Oid, Repository, RepositoryInitOptions};
+#[cfg(feature = "zip")]
 use sevenz_rust2::{ArchiveWriter, encoder_options};
 use std::path::Path;
-use crate::data::modified_file::ModifiedFile;
 
 /// `BackupManager` is a struct responsible for managing backup operations.
 ///
@@ -161,7 +162,8 @@ impl BackupManager {
             let commit = self.repository.find_commit(Oid::from_str(&commit_id)?)?;
             let item = BackupItem {
                 id: commit_id,
-                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds()).unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
                 description: commit
                     .message()
                     .unwrap_or("No description was provided")
@@ -189,7 +191,6 @@ impl BackupManager {
         }
         Ok(ids)
     }
-    
 
     /// Creates a backup by committing the current state of the repository.
     ///
@@ -399,7 +400,7 @@ impl BackupManager {
     ///
     /// * `backup_id` - A string-like identifier of the backup to export. This must correspond to a valid Git object ID (OID) in the repository.
     /// * `output_path` - The destination path for the created archive. This must be a valid filesystem path.
-    /// * `level` - Compression level to apply for the archive. The value determines the trade-off between compression size and speed.
+    /// * `level` - Compression level (0-9, clamped to this range). The value determines the trade-off between compression size and speed.
     ///
     /// # Returns
     ///
@@ -422,18 +423,19 @@ impl BackupManager {
     /// # Example
     ///
     /// ```rust
-    /// use std::path::Path;
-    ///
-    /// let repository = BackupRepository::new("/path/to/repository")?;
-    /// repository.export_backup_archive(
-    ///     "abcd1234ef567890abcd1234ef567890abcd1234", // Backup ID
-    ///     Path::new("/path/to/output/archive.7z"),   // Output path
-    ///     5,                                         // Compression level
-    /// )?;
+    /// use obsidian_backup_system::BackupManager;
+    /// ...
+    /// let manager:BackupManager; // Assume this is initialized properly
+    /// let last_backup = manager
+    ///    .last()
+    ///    .expect("Failed to get last backup")
+    ///    .expect("No backups found");
+    /// manager.export(last_backup.id, "exported.zip", 0).expect("Failed to export backup");
     /// ```
     ///
     /// In this example, the specified backup ID is packed into a `.7z` archive
     /// with medium compression level (5) and saved to the given output path.
+    #[cfg(feature = "zip")]
     pub fn export(
         &self,
         backup_id: impl AsRef<str>,
@@ -460,7 +462,6 @@ impl BackupManager {
         info!("Archive created successfully");
         Ok(())
     }
-
 
     /// Computes the list of files that were modified (added, updated, or deleted)
     /// in the specified backup/commit within the repository.
@@ -558,15 +559,16 @@ impl BackupManager {
 
                 // Try to get the content before from parent commit
                 let content_before = if let Some(ref parent_tree) = parent_tree {
-                    parent_tree.get_name(&name)
-                               .and_then(|parent_entry| {
-                                   if let Some(git2::ObjectType::Blob) = parent_entry.kind() {
-                                       self.repository.find_blob(parent_entry.id()).ok()
-                                   } else {
-                                       None
-                                   }
-                               })
-                               .map(|parent_blob| parent_blob.content().to_vec())
+                    parent_tree
+                        .get_name(&name)
+                        .and_then(|parent_entry| {
+                            if let Some(git2::ObjectType::Blob) = parent_entry.kind() {
+                                self.repository.find_blob(parent_entry.id()).ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|parent_blob| parent_blob.content().to_vec())
                 } else {
                     None
                 };
@@ -627,7 +629,8 @@ impl BackupManager {
             let commit = self.repository.find_commit(oid)?;
             let item = BackupItem {
                 id: oid.to_string(),
-                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds()).unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
+                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
                 description: commit
                     .message()
                     .unwrap_or("No description was provided")
@@ -705,6 +708,7 @@ impl BackupManager {
     ///     Ok(())
     /// }
     /// ```
+    #[cfg(feature = "zip")]
     fn add_tree_to_archive(
         &self,
         writer: &mut ArchiveWriter<std::fs::File>,
@@ -745,5 +749,4 @@ impl BackupManager {
         }
         Ok(())
     }
-    
 }

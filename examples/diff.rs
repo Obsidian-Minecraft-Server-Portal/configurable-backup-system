@@ -1,5 +1,5 @@
-use log::LevelFilter;
-use obsidian_backup_system::backup_manager::BackupManager;
+use log::{info, LevelFilter};
+use obsidian_backup_system::BackupManager;
 
 fn main() {
     pretty_env_logger::env_logger::builder()
@@ -10,10 +10,10 @@ fn main() {
     let manager = BackupManager::new("./target/dev-env/backups/test", "./target/dev-env/content")
         .expect("Failed to create BackupManager");
 	let last_backup = manager.last().expect("Failed to get last backup").expect("No backups found");
-    println!("Last backup: {:?}", last_backup);
+    info!("Last backup: {:?}", last_backup);
     let diffs = manager.diff(&last_backup.id).expect("Failed to get diffs");
-    println!("Diffs since last backup:");
+    info!("Diffs since last backup:");
     for diff in diffs {
-        println!("{:?}", diff);
+        info!("{:?}", diff);
     }
 }

@@ -1,5 +1,5 @@
 use log::LevelFilter;
-use obsidian_backup_system::backup_manager::BackupManager;
+use obsidian_backup_system::BackupManager;
 use std::io::Write;
 
 fn main() {

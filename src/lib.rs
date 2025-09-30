@@ -3,6 +3,8 @@ pub mod data;
 
 #[cfg(feature = "cli")]
 mod cli;
-pub mod backup_manager;
 
 pub(crate) mod log_stub;
+mod actions;
+
+pub use actions::BackupManager;
