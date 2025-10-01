@@ -24,11 +24,14 @@ sevenz-rust2 = { version = ">=0.19", optional = true }
 chrono = { version = "*", features = ["serde"] }
 
 [features]
-# This will build the CLI application
+# This will build the CLI application.
 cli = ["dep:clap", "dep:serde_json", "dep:pretty_env_logger"]
-# This will enable serialization/deserialization support
+
+# This will enable serialization/deserialization support.
 serde = ["dep:serde"]
-# This will enable logging support
+
+# This will enable logging support.
 logging = ["dep:log"]
-# This will enable support for exporting backups as 7z archives
+
+# This will enable support for exporting backups as 7z archives.
 zip = ["dep:sevenz-rust2"]
