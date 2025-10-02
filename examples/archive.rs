@@ -1,7 +1,7 @@
 #[cfg(feature = "zip")]
 fn main() {
     use log::LevelFilter;
-    use obsidian_backup_system::BackupManager;
+    use obsidian_backups::BackupManager;
     pretty_env_logger::env_logger::builder()
         .format_timestamp(None)
         .filter_level(LevelFilter::Trace)
@@ -13,7 +13,9 @@ fn main() {
         .last()
         .expect("Failed to get last backup")
         .expect("No backups found");
-    manager.export(last_backup.id, "./target/dev-env/exported.zip", 0).expect("Failed to export backup");
+    manager
+        .export(last_backup.id, "./target/dev-env/exported.zip", 0)
+        .expect("Failed to export backup");
 }
 
 #[cfg(not(feature = "zip"))]

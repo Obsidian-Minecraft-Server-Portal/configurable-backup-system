@@ -1,5 +1,5 @@
 use log::{info, LevelFilter};
-use obsidian_backup_system::BackupManager;
+use obsidian_backups::BackupManager;
 
 fn main() {
     pretty_env_logger::env_logger::builder()

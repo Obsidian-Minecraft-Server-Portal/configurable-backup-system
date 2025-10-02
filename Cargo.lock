@@ -713,7 +713,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "obsidian_backup_system"
+name = "obsidian-backups"
 version = "0.1.0"
 dependencies = [
  "anyhow",

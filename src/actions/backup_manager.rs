@@ -48,6 +48,25 @@ pub struct BackupManager {
 }
 
 impl BackupManager {
+    /// Helper function to check if a path should be excluded from backups
+    fn should_exclude(path: &Path) -> bool {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            // Exclude common system and temporary files
+            matches!(
+                name,
+                ".git" | ".DS_Store" | "Thumbs.db" | "desktop.ini" | 
+                ".Spotlight-V100" | ".Trashes" | "ehthumbs.db" | 
+                "ehthumbs_vista.db" | "$RECYCLE.BIN"
+            ) || name.starts_with("~$")  // Office temp files
+              || name.ends_with(".tmp")
+              || name.ends_with(".swp")
+              || name.ends_with("~")
+              || name == "__pycache__"
+        } else {
+            false
+        }
+    }
+
     /// Helper function to recursively add files from a directory to the git index
     fn add_directory_to_index(
         &self,
@@ -59,8 +78,9 @@ impl BackupManager {
             let entry = entry?;
             let path = entry.path();
 
-            // Skip .git files and directories
-            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            // Skip excluded files and directories
+            if Self::should_exclude(&path) {
+                debug!("Skipping excluded path: {:?}", path);
                 continue;
             }
 
@@ -439,22 +459,83 @@ impl BackupManager {
         let tree = commit.tree()?;
         debug!("Tree ID: {}", tree.id());
 
-        debug!("Checking out tree");
-        self.repository.checkout_tree(tree.as_object(), None)?;
-
         if let Some(ref workdir) = self.repository.workdir() {
             debug!("Working directory found: {:?}", workdir);
 
-            debug!("Removing existing working directory contents");
-            std::fs::remove_dir_all(workdir)?;
+            // Use safer restore approach with temporary directory
+            let temp_dir = workdir.parent()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory for working directory"))?
+                .join(format!("{}_restore_tmp", workdir.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("workdir")));
 
-            debug!("Recreating working directory");
-            std::fs::create_dir_all(workdir)?;
+            debug!("Using temporary directory: {:?}", temp_dir);
 
-            debug!("Checking out HEAD to working directory");
-            self.repository.checkout_head(None)?;
+            // Clean up temp directory if it exists from a previous failed restore
+            if temp_dir.exists() {
+                debug!("Cleaning up existing temporary directory");
+                std::fs::remove_dir_all(&temp_dir)?;
+            }
+
+            // Create temp directory
+            debug!("Creating temporary directory");
+            std::fs::create_dir_all(&temp_dir)?;
+
+            // Checkout to temp location
+            debug!("Checking out tree to temporary directory");
+            let mut checkout_opts = git2::build::CheckoutBuilder::new();
+            checkout_opts.target_dir(&temp_dir);
+            checkout_opts.force();
+            checkout_opts.remove_untracked(true);
+            self.repository.checkout_tree(tree.as_object(), Some(&mut checkout_opts))?;
+
+            // At this point, the checkout succeeded. Now perform the swap.
+            debug!("Checkout successful, swapping directories");
+
+            // Create a backup of the old working directory
+            let backup_dir = workdir.parent()
+                .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory for working directory"))?
+                .join(format!("{}_old_backup", workdir.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("workdir")));
+
+            // Clean up old backup if it exists
+            if backup_dir.exists() {
+                debug!("Cleaning up old backup directory");
+                std::fs::remove_dir_all(&backup_dir)?;
+            }
+
+            // Move current workdir to backup location
+            debug!("Moving current working directory to backup location");
+            std::fs::rename(workdir, &backup_dir)?;
+
+            // Move temp directory to workdir location
+            debug!("Moving temporary directory to working directory location");
+            match std::fs::rename(&temp_dir, workdir) {
+                Ok(_) => {
+                    debug!("Restore completed successfully, cleaning up old backup");
+                    // Only remove the old backup if the restore succeeded
+                    let _ = std::fs::remove_dir_all(&backup_dir);
+                }
+                Err(e) => {
+                    // If rename fails, try to restore the original
+                    error!("Failed to move temp directory: {}", e);
+                    debug!("Attempting to restore original working directory");
+                    if let Err(_restore_err) = std::fs::rename(&backup_dir, workdir) {
+                        error!("Failed to restore original directory: {}", _restore_err);
+                        return Err(anyhow::anyhow!(
+                            "Restore failed and could not recover original directory. Original backed up at: {:?}",
+                            backup_dir
+                        ));
+                    }
+                    return Err(anyhow::anyhow!("Failed to complete restore: {}", e));
+                }
+            }
         } else {
             warn!("No working directory configured for repository");
+            // For bare repositories, just update HEAD
+            debug!("Checking out tree in bare repository");
+            self.repository.checkout_tree(tree.as_object(), None)?;
         }
 
         info!("Backup restored successfully");
@@ -516,6 +597,9 @@ impl BackupManager {
         output_path: impl AsRef<Path>,
         level: u8,
     ) -> Result<()> {
+        // Validate and clamp compression level to 0-9 range
+        let level = level.clamp(0, 9);
+        
         let mut writer = ArchiveWriter::create(output_path)?;
         writer.set_content_methods(vec![
             encoder_options::Lzma2Options::from_level(level as u32).into(),
@@ -629,78 +713,170 @@ impl BackupManager {
             None
         };
 
+        // Recursively diff trees
+        self.diff_trees_recursive(&tree, parent_tree.as_ref(), "", &mut files)?;
+
+        Ok(files)
+    }
+
+    /// Helper method to recursively diff two trees
+    fn diff_trees_recursive(
+        &self,
+        tree: &git2::Tree,
+        parent_tree: Option<&git2::Tree>,
+        path_prefix: &str,
+        files: &mut Vec<ModifiedFile>,
+    ) -> Result<()> {
         // Check files in current tree (for added/modified files)
         for entry in tree.iter() {
-            if let Some(git2::ObjectType::Blob) = entry.kind() {
-                let name = entry.name().unwrap_or("").to_string();
-                let blob = self.repository.find_blob(entry.id())?;
-                let content_after = blob.content().to_vec();
+            let name = entry.name().unwrap_or("");
+            let full_path = if path_prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", path_prefix, name)
+            };
 
-                // Try to get the content before from parent commit
-                let content_before = if let Some(ref parent_tree) = parent_tree {
-                    parent_tree
-                        .get_name(&name)
-                        .and_then(|parent_entry| {
-                            if let Some(git2::ObjectType::Blob) = parent_entry.kind() {
-                                self.repository.find_blob(parent_entry.id()).ok()
-                            } else {
-                                None
-                            }
-                        })
-                        .map(|parent_blob| parent_blob.content().to_vec())
-                } else {
-                    None
-                };
+            match entry.kind() {
+                Some(git2::ObjectType::Blob) => {
+                    // It's a file
+                    let blob = self.repository.find_blob(entry.id())?;
+                    let content_after = blob.content().to_vec();
 
-                // Only add if file was added or modified
-                match &content_before {
-                    None => {
-                        // File was added
-                        files.push(ModifiedFile {
-                            path: name,
-                            content_before: None,
-                            content_after: Some(content_after),
-                        });
-                    }
-                    Some(before_content) => {
+                    // Try to get the content before from parent commit
+                    let content_before = if let Some(parent_tree) = parent_tree {
+                        parent_tree
+                            .get_name(name)
+                            .and_then(|parent_entry| {
+                                if let Some(git2::ObjectType::Blob) = parent_entry.kind() {
+                                    self.repository.find_blob(parent_entry.id()).ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .map(|parent_blob| parent_blob.content().to_vec())
+                    } else {
+                        None
+                    };
+
+                    // Only add if file was added or modified
+                    if let Some(before_content) = content_before {
                         // File existed before - check if it was modified
-                        if before_content != &content_after {
+                        if before_content != content_after {
                             files.push(ModifiedFile {
-                                path: name,
-                                content_before: Some(before_content.clone()),
+                                path: full_path,
+                                content_before: Some(before_content),
                                 content_after: Some(content_after),
                             });
                         }
                         // If content is the same, don't add to results
-                    }
-                }
-            }
-        }
-
-        // Check for files that were deleted (existed in parent but not in current)
-        if let Some(ref parent_tree) = parent_tree {
-            for parent_entry in parent_tree.iter() {
-                if let Some(git2::ObjectType::Blob) = parent_entry.kind() {
-                    let name = parent_entry.name().unwrap_or("").to_string();
-
-                    // If this file doesn't exist in the current tree, it was deleted
-                    if tree.get_name(&name).is_none() {
-                        let parent_blob = self.repository.find_blob(parent_entry.id())?;
-                        let content_before = parent_blob.content().to_vec();
-
+                    } else {
+                        // File was added
                         files.push(ModifiedFile {
-                            path: name,
-                            content_before: Some(content_before),
-                            content_after: None, // File was deleted
+                            path: full_path,
+                            content_before: None,
+                            content_after: Some(content_after),
                         });
                     }
                 }
+                Some(git2::ObjectType::Tree) => {
+                    // It's a directory, recurse into it
+                    let subtree = self.repository.find_tree(entry.id())?;
+                    let parent_subtree = parent_tree
+                        .and_then(|pt| pt.get_name(name))
+                        .and_then(|e| {
+                            if let Some(git2::ObjectType::Tree) = e.kind() {
+                                self.repository.find_tree(e.id()).ok()
+                            } else {
+                                None
+                            }
+                        });
+                    self.diff_trees_recursive(&subtree, parent_subtree.as_ref(), &full_path, files)?;
+                }
+                _ => {
+                    // Skip other object types
+                }
             }
         }
 
-        Ok(files)
+        // Check for files/directories that were deleted (existed in parent but not in current)
+        if let Some(parent_tree) = parent_tree {
+            for parent_entry in parent_tree.iter() {
+                let name = parent_entry.name().unwrap_or("");
+                let full_path = if path_prefix.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", path_prefix, name)
+                };
+
+                // If this entry doesn't exist in the current tree, it was deleted
+                if tree.get_name(name).is_none() {
+                    match parent_entry.kind() {
+                        Some(git2::ObjectType::Blob) => {
+                            // File was deleted
+                            let parent_blob = self.repository.find_blob(parent_entry.id())?;
+                            let content_before = parent_blob.content().to_vec();
+
+                            files.push(ModifiedFile {
+                                path: full_path,
+                                content_before: Some(content_before),
+                                content_after: None,
+                            });
+                        }
+                        Some(git2::ObjectType::Tree) => {
+                            // Directory was deleted - recursively add all files as deleted
+                            let parent_subtree = self.repository.find_tree(parent_entry.id())?;
+                            self.diff_trees_recursive(&parent_subtree, Some(&parent_subtree), &full_path, &mut Vec::new())?;
+                            // Mark all files in the deleted directory
+                            self.mark_tree_as_deleted(&parent_subtree, &full_path, files)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Helper method to mark all files in a tree as deleted
+    fn mark_tree_as_deleted(
+        &self,
+        tree: &git2::Tree,
+        path_prefix: &str,
+        files: &mut Vec<ModifiedFile>,
+    ) -> Result<()> {
+        for entry in tree.iter() {
+            let name = entry.name().unwrap_or("");
+            let full_path = if path_prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", path_prefix, name)
+            };
+
+            match entry.kind() {
+                Some(git2::ObjectType::Blob) => {
+                    let blob = self.repository.find_blob(entry.id())?;
+                    files.push(ModifiedFile {
+                        path: full_path,
+                        content_before: Some(blob.content().to_vec()),
+                        content_after: None,
+                    });
+                }
+                Some(git2::ObjectType::Tree) => {
+                    let subtree = self.repository.find_tree(entry.id())?;
+                    self.mark_tree_as_deleted(&subtree, &full_path, files)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
     pub fn last(&self) -> Result<Option<BackupItem>> {
+        // Check if HEAD exists first
+        if self.repository.head().is_err() {
+            return Ok(None);  // No backups yet
+        }
+
         let mut rev_walk = self.repository.revwalk()?;
         rev_walk.push_head()?;
         if let Some(oid) = rev_walk.next() {

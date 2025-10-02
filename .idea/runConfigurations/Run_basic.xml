@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="Run basic" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
-    <option name="command" value="run --package obsidian_backup_system --example basic --all-features" />
+    <option name="command" value="run --package obsidian-backups --example basic --all-features" />
     <option name="workingDirectory" value="file://$PROJECT_DIR$" />
     <envs />
     <option name="emulateTerminal" value="true" />

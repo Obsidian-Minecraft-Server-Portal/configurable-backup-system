@@ -5,11 +5,11 @@ mod test {
 
     /// Helper function to create a unique test environment
     fn setup_test_env(test_name: &str) -> (PathBuf, PathBuf) {
-        pretty_env_logger::env_logger::builder()
+        let _ = pretty_env_logger::env_logger::builder()
             .format_timestamp(None)
             .filter_level(LevelFilter::Trace)
             .is_test(true)
-            .init();
+            .try_init();
         let base_dir = PathBuf::from("target/test_backup_manager");
         let store_dir = base_dir.join(format!("{}_store", test_name));
         let working_dir = base_dir.join(format!("{}_working", test_name));
@@ -31,7 +31,7 @@ mod test {
         fs::write(file_path, content).expect("Failed to create test file");
     }
 
-    use obsidian_backup_system::BackupManager;
+    use obsidian_backups::BackupManager;
 
     #[test]
     fn test_backup_manager_new() {
@@ -181,9 +181,9 @@ mod test {
         let manager =
             BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
 
-        // No backups yet - last() will fail because there's no HEAD
-        let last_result = manager.last();
-        assert!(last_result.is_err(), "Should fail when no backups exist");
+        // No backups yet - last() should return Ok(None)
+        let last_result = manager.last().expect("Failed to call last()");
+        assert!(last_result.is_none(), "Should return None when no backups exist");
 
         // Create backups
         manager
@@ -548,6 +548,62 @@ mod test {
         assert!(
             result.is_err(),
             "Should fail to export with invalid backup ID"
+        );
+    }
+
+    #[test]
+    fn test_diff_nested_directories() {
+        let (store_dir, working_dir) = setup_test_env("diff_nested");
+
+        // Create nested directory structure
+        let subdir = working_dir.join("subdir");
+        let deep_subdir = subdir.join("deep");
+        fs::create_dir_all(&deep_subdir).expect("Failed to create subdirectories");
+
+        create_test_file(&working_dir, "root.txt", b"Root file");
+        create_test_file(&subdir, "sub.txt", b"Sub file");
+        create_test_file(&deep_subdir, "deep.txt", b"Deep file");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        // Create first backup
+        manager
+            .backup(Some("Initial nested structure".to_string()))
+            .expect("Failed to create first backup");
+
+        // Modify files in nested directories
+        create_test_file(&subdir, "sub.txt", b"Modified sub file");
+        create_test_file(&deep_subdir, "deep.txt", b"Modified deep file");
+        create_test_file(&deep_subdir, "new_deep.txt", b"New deep file");
+
+        // Create second backup with nested changes
+        let backup_id = manager
+            .backup(Some("Modified nested structure".to_string()))
+            .expect("Failed to create second backup");
+
+        // Get diff
+        let diffs = manager.diff(&backup_id).expect("Failed to get diff");
+
+        // Verify nested files are detected
+        assert!(
+            diffs.iter().any(|d| d.path.contains("subdir/sub.txt") || d.path.contains("subdir\\sub.txt")),
+            "Diff should include modified file in subdirectory"
+        );
+        assert!(
+            diffs.iter().any(|d| d.path.contains("deep/deep.txt") || d.path.contains("deep\\deep.txt")),
+            "Diff should include modified file in deep subdirectory"
+        );
+        assert!(
+            diffs.iter().any(|d| d.path.contains("new_deep.txt")),
+            "Diff should include new file in deep subdirectory"
+        );
+
+        // Verify at least 3 changes (2 modified + 1 added)
+        assert!(
+            diffs.len() >= 3,
+            "Should have at least 3 changes in nested directories, got {}",
+            diffs.len()
         );
     }
 }

@@ -1,7 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use log::LevelFilter;
-use obsidian_backup_system::BackupManager;
+use obsidian_backups::BackupManager;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -103,7 +103,8 @@ fn main() -> Result<()> {
         .init();
 
     // Initialize BackupManager
-    let manager = BackupManager::new(&cli.store_directory, &cli.working_directory)?;
+    let manager = BackupManager::new(&cli.store_directory, &cli.working_directory)
+        .context("Failed to initialize backup manager")?;
 
     match cli.command {
         Commands::Init => {
@@ -113,20 +114,24 @@ fn main() -> Result<()> {
         }
 
         Commands::Backup { description } => {
-            let commit_id = manager.backup(description.clone())?;
+            let desc_copy = description.clone();
+            let commit_id = manager.backup(description)
+                .context("Failed to create backup")?;
             println!("Backup created successfully");
             println!("Backup ID: {}", commit_id);
-            if let Some(desc) = description {
+            if let Some(desc) = desc_copy {
                 println!("Description: {}", desc);
             }
         }
 
         Commands::List { json } => {
-            let backups = manager.list()?;
+            let backups = manager.list()
+                .context("Failed to list backups")?;
             if json {
                 #[cfg(feature = "serde")]
                 {
-                    println!("{}", serde_json::to_string_pretty(&backups)?);
+                    println!("{}", serde_json::to_string_pretty(&backups)
+                        .context("Failed to serialize backups to JSON")?);
                 }
                 #[cfg(not(feature = "serde"))]
                 {
@@ -150,12 +155,14 @@ fn main() -> Result<()> {
         }
 
         Commands::Last { json } => {
-            match manager.last()? {
+            match manager.last()
+                .context("Failed to get last backup")? {
                 Some(backup) => {
                     if json {
                         #[cfg(feature = "serde")]
                         {
-                            println!("{}", serde_json::to_string_pretty(&backup)?);
+                            println!("{}", serde_json::to_string_pretty(&backup)
+                                .context("Failed to serialize backup to JSON")?);
                         }
                         #[cfg(not(feature = "serde"))]
                         {
@@ -176,7 +183,8 @@ fn main() -> Result<()> {
         }
 
         Commands::Restore { backup_id } => {
-            manager.restore(&backup_id)?;
+            manager.restore(&backup_id)
+                .context(format!("Failed to restore backup {}", backup_id))?;
             println!("Backup restored successfully");
             println!("Restored backup ID: {}", backup_id);
         }
@@ -188,7 +196,8 @@ fn main() -> Result<()> {
             level,
         } => {
             let level = level.clamp(0, 9);
-            manager.export(&backup_id, &output, level)?;
+            manager.export(&backup_id, &output, level)
+                .context(format!("Failed to export backup {} to {:?}", backup_id, output))?;
             println!("Backup exported successfully");
             println!("Backup ID: {}", backup_id);
             println!("Output: {:?}", output);
@@ -200,11 +209,13 @@ fn main() -> Result<()> {
             json,
             show_content,
         } => {
-            let diffs = manager.diff(&backup_id)?;
+            let diffs = manager.diff(&backup_id)
+                .context(format!("Failed to get diff for backup {}", backup_id))?;
             if json {
                 #[cfg(feature = "serde")]
                 {
-                    println!("{}", serde_json::to_string_pretty(&diffs)?);
+                    println!("{}", serde_json::to_string_pretty(&diffs)
+                        .context("Failed to serialize diff to JSON")?);
                 }
                 #[cfg(not(feature = "serde"))]
                 {
@@ -223,7 +234,7 @@ fn main() -> Result<()> {
                                 println!("[ADDED] {}", diff.path);
                                 if show_content {
                                     println!("  Size: {} bytes", after.len());
-                                    if let Ok(content) = String::from_utf8(after.clone()) {
+                                    if let Ok(content) = std::str::from_utf8(after) {
                                         println!("  Content:\n{}", content);
                                     }
                                 }
@@ -232,7 +243,7 @@ fn main() -> Result<()> {
                                 println!("[DELETED] {}", diff.path);
                                 if show_content {
                                     println!("  Size: {} bytes", before.len());
-                                    if let Ok(content) = String::from_utf8(before.clone()) {
+                                    if let Ok(content) = std::str::from_utf8(before) {
                                         println!("  Content:\n{}", content);
                                     }
                                 }
@@ -243,8 +254,8 @@ fn main() -> Result<()> {
                                     println!("  Before size: {} bytes", before.len());
                                     println!("  After size: {} bytes", after.len());
                                     if let (Ok(before_content), Ok(after_content)) = (
-                                        String::from_utf8(before.clone()),
-                                        String::from_utf8(after.clone()),
+                                        std::str::from_utf8(before),
+                                        std::str::from_utf8(after),
                                     ) {
                                         println!("  Before:\n{}", before_content);
                                         println!("  After:\n{}", after_content);

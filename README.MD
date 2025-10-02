@@ -8,12 +8,18 @@ This library uses Git under the hood to provide efficient, version-controlled ba
 
 - 🔄 **Create backups** - Snapshot your files and directories using Git commits
 - 📋 **List backups** - View all available backup points with timestamps and descriptions
-- ⏮️ **Restore backups** - Roll back to any previous backup state
-- 🔍 **Diff backups** - See exactly what changed between backup points
+- ⏮️ **Restore backups** - Safely roll back to any previous backup state with atomic operations
+- 🔍 **Diff backups** - See exactly what changed between backup points, including nested directories
 - 📦 **Export backups** - Create compressed archives (7z) from any backup (requires `zip` feature)
 - 🏷️ **Backup descriptions** - Add meaningful descriptions to track what each backup represents
 - ⚡ **Efficient storage** - Leverages Git's delta compression for space-efficient storage
 - 🔧 **Optional features** - Enable only the functionality you need
+- 🛡️ **Smart exclusions** - Automatically excludes system files (.git, .DS_Store, temp files, etc.)
+
+## Requirements
+
+- **Rust Edition 2024** - This crate requires Rust edition 2024 or later
+- **Rust Version** - Rust 1.82.0 or later (for edition 2024 support)
 
 ## Installation
 
@@ -21,14 +27,14 @@ This crate is not yet published on crates.io. To use it, add the following to yo
 
 ```toml
 [dependencies]
-obsidian_backup_system = { git = "https://github.com/Obsidian-Minecraft-Server-Portal/obsidian-backup-system.git" }
+obsidian-backups = { git = "https://github.com/Obsidian-Minecraft-Server-Portal/obsidian-backup-system.git" }
 ```
 
 ### With Optional Features
 
 ```toml
 [dependencies]
-obsidian_backup_system = { git = "https://github.com/Obsidian-Minecraft-Server-Portal/obsidian-backup-system.git", features = ["serde", "logging", "zip"] }
+obsidian-backups = { git = "https://github.com/Obsidian-Minecraft-Server-Portal/obsidian-backup-system.git", features = ["serde", "logging", "zip"] }
 ```
 
 ## Available Features
@@ -45,7 +51,7 @@ obsidian_backup_system = { git = "https://github.com/Obsidian-Minecraft-Server-P
 ### Initialize BackupManager
 
 ```rust
-use obsidian_backup_system::BackupManager;
+use obsidian_backups::BackupManager;
 
 // Create a backup manager
 // store_directory: where backup metadata is stored (.git repository)
@@ -66,6 +72,12 @@ println!("Created backup with ID: {}", backup_id);
 let backup_id = manager.backup(Some("Before major update".to_string()))
 .expect("Failed to create backup");
 ```
+
+**Note:** Backups automatically exclude common system and temporary files:
+- Version control: `.git`
+- System files: `.DS_Store`, `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`
+- Temporary files: `*.tmp`, `*.swp`, `~*`, Office temp files (`~$*`)
+- Python cache: `__pycache__`
 
 ### List All Backups
 
@@ -100,6 +112,12 @@ manager.restore( & backup_id)
 .expect("Failed to restore backup");
 ```
 
+**Safety Note:** The restore operation uses a safe atomic approach:
+- Files are first checked out to a temporary directory
+- The working directory is backed up before being replaced
+- If restoration fails, the original directory is automatically restored
+- This prevents data loss from partial or failed restore operations
+
 ### View Changes (Diff)
 
 ```rust
@@ -126,15 +144,18 @@ for file in modified_files {
 {
     // Export a backup as a 7z archive
     // compression_level: 0-9 (0 = no compression, 9 = maximum compression)
+    // Values outside this range are automatically clamped
     manager.export( & backup_id, "./backup.7z", 5)
     .expect("Failed to export backup");
 }
 ```
 
+**Note:** Compression levels are automatically validated and clamped to the valid range (0-9). Values below 0 become 0, and values above 9 become 9.
+
 ## Complete Example
 
 ```rust
-use obsidian_backup_system::BackupManager;
+use obsidian_backups::BackupManager;
 use std::fs;
 
 fn main() -> anyhow::Result<()> {
