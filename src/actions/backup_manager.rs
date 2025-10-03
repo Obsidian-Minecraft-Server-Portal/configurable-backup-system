@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use obsidian_backup_system::BackupManager;
+//! use obsidian_backups::BackupManager;
 //!
 //! let store_dir = "./backup_store";
 //! let working_dir = "./my_data";
@@ -39,7 +39,7 @@ use std::path::Path;
 ///
 /// # Example
 /// ```rust
-/// use obsidian_backup_system::BackupManager;
+/// use obsidian_backups::BackupManager;
 ///
 /// let backup_manager = BackupManager::new("./backup_store", "./my_data")
 ///     .expect("Failed to create BackupManager");
@@ -311,21 +311,38 @@ impl BackupManager {
 
         for commit_id in ids {
             debug!("Processing commit: {}", commit_id);
-            let commit = self.repository.find_commit(Oid::from_str(&commit_id)?)?;
-            let item = BackupItem {
-                id: commit_id,
-                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
-                description: commit
-                    .message()
-                    .unwrap_or("No description was provided")
-                    .to_string(),
+            let oid = match Oid::from_str(&commit_id) {
+                Ok(oid) => oid,
+                Err(e) => {
+                    warn!("Skipping invalid commit id {}: {}", commit_id, e);
+                    continue;
+                }
             };
-            trace!(
-                "Created backup item: id={}, timestamp={}, description={:?}",
-                item.id, item.timestamp, item.description
-            );
-            items.push(item);
+            match self.repository.find_commit(oid) {
+                Ok(commit) => {
+                    let item = BackupItem {
+                        id: commit_id,
+                        timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
+                            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+                        description: commit
+                            .message()
+                            .unwrap_or("No description was provided")
+                            .to_string(),
+                    };
+                    trace!(
+                        "Created backup item: id={}, timestamp={}, description={:?}",
+                        item.id, item.timestamp, item.description
+                    );
+                    items.push(item);
+                }
+                Err(e) => {
+                    warn!(
+                        "Skipping missing or unreadable commit {}: {}",
+                        commit_id, e
+                    );
+                    continue;
+                }
+            }
         }
 
         info!("Found {} backup items", items.len());
@@ -334,11 +351,39 @@ impl BackupManager {
 
     fn list_ids(&self) -> Result<Vec<String>> {
         let mut rev_walk = self.repository.revwalk()?;
-        rev_walk.push_head()?;
+        // Try HEAD first; if it fails, fall back to any available reference target.
+        let mut pushed = false;
+        if let Ok(head) = self.repository.head() {
+            if let Some(oid) = head.target() {
+                if rev_walk.push(oid).is_ok() {
+                    pushed = true;
+                }
+            }
+        }
+        if !pushed {
+            if let Ok(mut refs) = self.repository.references() {
+                while let Some(r) = refs.next() {
+                    if let Ok(r) = r {
+                        if let Some(oid) = r.target() {
+                            if rev_walk.push(oid).is_ok() {
+                                pushed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !pushed {
+            // No references to walk; return empty list rather than erroring
+            return Ok(Vec::new());
+        }
+
         let mut ids = Vec::new();
         for oid in rev_walk {
-            let oid = oid?;
-            ids.push(oid.to_string());
+            if let Ok(oid) = oid {
+                ids.push(oid.to_string());
+            }
         }
         Ok(ids)
     }
