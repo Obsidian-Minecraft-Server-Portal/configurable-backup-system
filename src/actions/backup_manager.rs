@@ -20,11 +20,11 @@
 use crate::data::backup_item::BackupItem;
 use crate::data::modified_file::ModifiedFile;
 use crate::log_stub::*;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use git2::{Oid, Repository, RepositoryInitOptions};
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 #[cfg(feature = "zip")]
-use sevenz_rust2::{encoder_options, ArchiveWriter};
+use sevenz_rust2::{ArchiveWriter, encoder_options};
 use std::fs;
 use std::path::Path;
 
@@ -53,8 +53,8 @@ impl BackupManager {
     /// Helper function to check if a path should be excluded from backups using ignore patterns in `exclude.obak`
     fn should_exclude(&self, path: &Path, is_dir: bool) -> bool {
         // Always skip the Git metadata directory and common junk files
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name == ".git"
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name == ".git"
                 || matches!(
                     name,
                     ".DS_Store"
@@ -70,10 +70,9 @@ impl BackupManager {
                 || name.ends_with(".tmp")
                 || name.ends_with(".swp")
                 || name.ends_with("~")
-                || name == "__pycache__"
-            {
-                return true;
-            }
+                || name == "__pycache__")
+        {
+            return true;
         }
 
         if let Some(matcher) = &self.ignore_matcher {
@@ -233,10 +232,10 @@ impl BackupManager {
 
         let ignore_file = ignore_file.as_ref();
 
-        if ignore_file.exists() {
-            if let Some(e) = builder.add(ignore_file) {
-                warn!("Failed to add ignore file {ignore_file:?}: {e}");
-            }
+        if ignore_file.exists()
+            && let Some(e) = builder.add(ignore_file)
+        {
+            warn!("Failed to add ignore file {ignore_file:?}: {e}");
         }
         match builder.build() {
             Ok(ignore_matcher) => {
@@ -336,10 +335,7 @@ impl BackupManager {
                     items.push(item);
                 }
                 Err(e) => {
-                    warn!(
-                        "Skipping missing or unreadable commit {}: {}",
-                        commit_id, e
-                    );
+                    warn!("Skipping missing or unreadable commit {}: {}", commit_id, e);
                     continue;
                 }
             }
@@ -353,24 +349,20 @@ impl BackupManager {
         let mut rev_walk = self.repository.revwalk()?;
         // Try HEAD first; if it fails, fall back to any available reference target.
         let mut pushed = false;
-        if let Ok(head) = self.repository.head() {
-            if let Some(oid) = head.target() {
-                if rev_walk.push(oid).is_ok() {
-                    pushed = true;
-                }
-            }
+        if let Ok(head) = self.repository.head()
+            && let Some(oid) = head.target()
+            && rev_walk.push(oid).is_ok()
+        {
+            pushed = true;
         }
-        if !pushed {
-            if let Ok(mut refs) = self.repository.references() {
-                while let Some(r) = refs.next() {
-                    if let Ok(r) = r {
-                        if let Some(oid) = r.target() {
-                            if rev_walk.push(oid).is_ok() {
-                                pushed = true;
-                                break;
-                            }
-                        }
-                    }
+        if !pushed && let Ok(refs) = self.repository.references() {
+            for r in refs {
+                if let Ok(r) = r
+                    && let Some(oid) = r.target()
+                    && rev_walk.push(oid).is_ok()
+                {
+                    pushed = true;
+                    break;
                 }
             }
         }
@@ -380,10 +372,8 @@ impl BackupManager {
         }
 
         let mut ids = Vec::new();
-        for oid in rev_walk {
-            if let Ok(oid) = oid {
-                ids.push(oid.to_string());
-            }
+        for oid in rev_walk.flatten() {
+            ids.push(oid.to_string());
         }
         Ok(ids)
     }
@@ -1394,11 +1384,11 @@ impl BackupManager {
         }
 
         // Also include HEAD if it exists
-        if let Ok(head) = self.repository.head() {
-            if let Some(oid) = head.target() {
-                to_visit.push_back(oid);
-                reachable.insert(oid);
-            }
+        if let Ok(head) = self.repository.head()
+            && let Some(oid) = head.target()
+        {
+            to_visit.push_back(oid);
+            reachable.insert(oid);
         }
 
         // Traverse the object graph
@@ -1490,10 +1480,10 @@ impl BackupManager {
                         pruned_count += 1;
 
                         // Remove directory if it's now empty
-                        if let Ok(mut entries) = fs::read_dir(&dir_path) {
-                            if entries.next().is_none() {
-                                let _ = fs::remove_dir(&dir_path);
-                            }
+                        if let Ok(mut entries) = fs::read_dir(&dir_path)
+                            && entries.next().is_none()
+                        {
+                            let _ = fs::remove_dir(&dir_path);
                         }
                     }
                 }
@@ -1587,12 +1577,11 @@ impl BackupManager {
             let dir_name = format!("{:02x}", i);
             let dir_path = objects_dir.join(&dir_name);
 
-            if dir_path.exists() {
-                if let Ok(mut entries) = fs::read_dir(&dir_path) {
-                    if entries.next().is_none() {
-                        let _ = fs::remove_dir(&dir_path);
-                    }
-                }
+            if dir_path.exists()
+                && let Ok(mut entries) = fs::read_dir(&dir_path)
+                && entries.next().is_none()
+            {
+                let _ = fs::remove_dir(&dir_path);
             }
         }
 
@@ -1609,10 +1598,10 @@ impl BackupManager {
             let name = reference.name().unwrap_or("");
 
             // Only pack refs under refs/ (not HEAD or other special refs)
-            if name.starts_with("refs/") {
-                if let Some(target) = reference.target() {
-                    refs_to_pack.push((name.to_string(), target));
-                }
+            if name.starts_with("refs/")
+                && let Some(target) = reference.target()
+            {
+                refs_to_pack.push((name.to_string(), target));
             }
         }
 
