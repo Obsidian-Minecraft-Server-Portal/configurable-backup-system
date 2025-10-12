@@ -140,18 +140,48 @@ for file in modified_files {
 
 ### Export Backup as Archive (requires `zip` feature)
 
+#### Export to File
+
 ```rust
 #[cfg(feature = "zip")]
 {
-    // Export a backup as a 7z archive
+    // Export a backup as a 7z archive to a file
     // compression_level: 0-9 (0 = no compression, 9 = maximum compression)
     // Values outside this range are automatically clamped
-    manager.export( & backup_id, "./backup.7z", 5)
-    .expect("Failed to export backup");
+    manager.export(&backup_id, "./backup.7z", 5)
+        .expect("Failed to export backup");
 }
 ```
 
-**Note:** Compression levels are automatically validated and clamped to the valid range (0-9). Values below 0 become 0, and values above 9 become 9.
+#### Export to Stream
+
+For scenarios where you need to stream the archive directly (e.g., HTTP responses, in-memory processing):
+
+```rust
+#[cfg(feature = "zip")]
+{
+    use std::io::Cursor;
+
+    // Export to an in-memory buffer
+    let mut buffer = Cursor::new(Vec::new());
+    manager.export_to_stream(&backup_id, &mut buffer, 5)
+        .expect("Failed to export backup to stream");
+
+    // Get the archive bytes
+    let archive_bytes = buffer.into_inner();
+    println!("Archive size: {} bytes", archive_bytes.len());
+
+    // You can also use any other writer that implements Write + Seek:
+    // - File handles
+    // - TCP streams with buffering
+    // - Custom buffers
+}
+```
+
+**Note:**
+- Compression levels are automatically validated and clamped to the valid range (0-9). Values below 0 become 0, and values above 9 become 9.
+- The 7z format requires seeking, so the writer must implement both `Write` and `Seek` traits.
+- For streaming over network without seek capability, export to a buffer first, then send the bytes.
 
 ### Purge Old Backups
 
@@ -578,12 +608,14 @@ The main struct for managing backups.
 #### Methods
 
 - `new(store_directory, working_directory) -> Result<Self>` - Initialize a new backup manager
+- `setup_ignore_file(ignore_file: impl AsRef<Path>) -> Result<()>` - Configure ignore patterns from a `.gitignore`-style file
 - `backup(description: Option<String>) -> Result<String>` - Create a new backup, returns backup ID
 - `list() -> Result<Vec<BackupItem>>` - List all available backups
 - `last() -> Result<Option<BackupItem>>` - Get the most recent backup
 - `restore(backup_id: impl AsRef<str>) -> Result<()>` - Restore a specific backup
 - `diff(backup_id: impl AsRef<str>) -> Result<Vec<ModifiedFile>>` - Get changes in a backup
-- `export(backup_id, output_path, level: u8) -> Result<()>` - Export backup as 7z archive (requires `zip` feature)
+- `export(backup_id, output_path, level: u8) -> Result<()>` - Export backup as 7z archive to file (requires `zip` feature)
+- `export_to_stream<W: Write + Seek>(backup_id, writer: W, level: u8) -> Result<()>` - Export backup as 7z archive to a stream (requires `zip` feature)
 - `purge_backups_over_count(count: usize) -> Result<()>` - Keep only the N most recent backups, remove older ones
 - `purge_backups_older_than(period: chrono::Duration) -> Result<()>` - Remove backups older than specified duration
 - `purge_backups_over_size(size: usize) -> Result<()>` - Remove old backups to keep repository under size limit (in bytes)
