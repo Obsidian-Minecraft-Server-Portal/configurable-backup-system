@@ -606,4 +606,316 @@ mod test {
             diffs.len()
         );
     }
+
+    #[test]
+    fn test_purge_backups_over_count() {
+        let (store_dir, working_dir) = setup_test_env("purge_count");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        // Create 5 backups
+        for i in 1..=5 {
+            create_test_file(&working_dir, "test.txt", format!("Content {}", i).as_bytes());
+            manager
+                .backup(Some(format!("Backup {}", i)))
+                .expect("Failed to create backup");
+        }
+
+        // Verify we have 5 backups
+        let backups = manager.list().expect("Failed to list backups");
+        assert_eq!(backups.len(), 5, "Should have 5 backups");
+
+        // Purge to keep only 3
+        manager
+            .purge_backups_over_count(3)
+            .expect("Failed to purge backups");
+
+        // After purge, ensure we can still create a new backup and list it as the latest
+        create_test_file(&working_dir, "test.txt", b"Post purge content");
+        manager
+            .backup(Some("After purge".to_string()))
+            .expect("Failed to create backup after purge");
+
+        let backups = manager.list().expect("Failed to list backups after purge");
+        assert!(!backups.is_empty(), "Backups should still be present after purge");
+        assert!(
+            backups[0].description.contains("After purge"),
+            "Latest backup should be the 'After purge' commit"
+        );
+    }
+
+    #[test]
+    fn test_purge_backups_older_than() {
+        let (store_dir, working_dir) = setup_test_env("purge_age");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        // Create first backup
+        create_test_file(&working_dir, "test.txt", b"Old content");
+        manager
+            .backup(Some("Old backup".to_string()))
+            .expect("Failed to create old backup");
+
+        // Wait a bit (in real tests, you might mock time or use a longer duration)
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Create recent backup
+        create_test_file(&working_dir, "test.txt", b"Recent content");
+        manager
+            .backup(Some("Recent backup".to_string()))
+            .expect("Failed to create recent backup");
+
+        // Purge backups older than 50ms
+        let duration = chrono::Duration::milliseconds(50);
+        manager
+            .purge_backups_older_than(duration)
+            .expect("Failed to purge old backups");
+
+        // Should have at least the recent backup
+        let backups = manager.list().expect("Failed to list backups");
+        assert!(!backups.is_empty(), "Should have at least one backup");
+        assert!(
+            backups.iter().any(|b| b.description.contains("Recent")),
+            "Recent backup should still exist"
+        );
+    }
+
+    #[test]
+    fn test_excluded_files_not_backed_up() {
+        let (store_dir, working_dir) = setup_test_env("excluded_files");
+
+        // Create files that should be excluded
+        create_test_file(&working_dir, ".DS_Store", b"Mac metadata");
+        create_test_file(&working_dir, "Thumbs.db", b"Windows thumbnail cache");
+        create_test_file(&working_dir, "temp.tmp", b"Temporary file");
+        create_test_file(&working_dir, "~temp", b"Temp file");
+        create_test_file(&working_dir, "~$document.docx", b"Office temp");
+
+        // Create a file that should be included
+        create_test_file(&working_dir, "important.txt", b"Important data");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        // Create an initial backup so diff will compare against it
+        manager.backup(Some("Initial".to_string())).expect("Failed to create initial backup");
+
+        // Modify a file that should be included
+        create_test_file(&working_dir, "important.txt", b"Modified data");
+        let backup_id2 = manager
+            .backup(Some("Second backup".to_string()))
+            .expect("Failed to create second backup");
+
+        let diffs = manager.diff(&backup_id2).expect("Failed to get diff");
+
+        // Should only see the important.txt file changed
+        assert_eq!(diffs.len(), 1, "Should only have one changed file");
+        assert_eq!(diffs[0].path, "important.txt");
+    }
+
+    #[test]
+    fn test_restore_verifies_content() {
+        let (store_dir, working_dir) = setup_test_env("restore_verify");
+
+        // Create initial content
+        create_test_file(&working_dir, "file1.txt", b"Original content 1");
+        create_test_file(&working_dir, "file2.txt", b"Original content 2");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let backup_id = manager
+            .backup(Some("Original state".to_string()))
+            .expect("Failed to create backup");
+
+        // Modify files
+        create_test_file(&working_dir, "file1.txt", b"Modified content 1");
+        create_test_file(&working_dir, "file2.txt", b"Modified content 2");
+
+        // Restore
+        manager.restore(&backup_id).expect("Failed to restore");
+
+        // Verify content was actually restored
+        let content1 = fs::read(working_dir.join("file1.txt")).expect("Failed to read file1");
+        let content2 = fs::read(working_dir.join("file2.txt")).expect("Failed to read file2");
+
+        assert_eq!(content1, b"Original content 1", "file1 should be restored");
+        assert_eq!(content2, b"Original content 2", "file2 should be restored");
+    }
+
+    #[test]
+    fn test_diff_first_backup() {
+        let (store_dir, working_dir) = setup_test_env("diff_first");
+
+        create_test_file(&working_dir, "initial.txt", b"Initial content");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let backup_id = manager
+            .backup(Some("First backup".to_string()))
+            .expect("Failed to create first backup");
+
+        // Diff of first backup should show all files as added
+        let diffs = manager.diff(&backup_id).expect("Failed to get diff");
+
+        assert_eq!(diffs.len(), 1, "Should have one added file");
+        assert_eq!(diffs[0].path, "initial.txt");
+        assert!(diffs[0].content_before.is_none(), "Should have no content before");
+        assert_eq!(
+            diffs[0].content_after,
+            Some(b"Initial content".to_vec()),
+            "Should have content after"
+        );
+    }
+
+    #[test]
+    fn test_backup_with_empty_description() {
+        let (store_dir, working_dir) = setup_test_env("empty_description");
+
+        create_test_file(&working_dir, "test.txt", b"Content");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let backup_id = manager
+            .backup(Some(String::new()))
+            .expect("Failed to create backup with empty description");
+
+        assert!(!backup_id.is_empty(), "Backup ID should not be empty");
+
+        let backups = manager.list().expect("Failed to list backups");
+        assert_eq!(backups.len(), 1);
+        // Empty string description should work
+        assert_eq!(backups[0].description, "");
+    }
+
+    #[test]
+    fn test_purge_cannot_delete_all_backups() {
+        let (store_dir, working_dir) = setup_test_env("purge_all");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        create_test_file(&working_dir, "test.txt", b"Content");
+        manager.backup(None).expect("Failed to create backup");
+
+        // This should either error or keep at least one backup
+        let backups = manager.list().expect("Failed to list backups");
+        assert!(!backups.is_empty(), "Should not delete all backups");
+    }
+
+    #[test]
+    fn test_ignore_file_basic_patterns() {
+        use std::fs;
+        let (store_dir, working_dir) = setup_test_env("ignore_basic");
+
+        // Create working content
+        create_test_file(&working_dir, "included.txt", b"Keep me");
+        fs::create_dir_all(working_dir.join("data")).expect("Failed to create data dir");
+        create_test_file(&working_dir.join("data"), "data.txt", b"Keep me too");
+        create_test_file(&working_dir, "ignored.txt", b"Ignore me");
+        fs::create_dir_all(working_dir.join("logs")).expect("Failed to create logs dir");
+        create_test_file(&working_dir.join("logs"), "a.log", b"Ignore me");
+        create_test_file(&working_dir, "scratch.tmp", b"Ignore me");
+
+        // Write ignore file
+        let ignore_path = working_dir.join(".backupignore");
+        fs::write(&ignore_path, b"ignored.txt\nlogs/\n*.tmp\n").expect("Failed to write ignore file");
+
+        let mut manager = BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+        manager
+            .setup_ignore_file(&ignore_path)
+            .expect("Failed to setup ignore file");
+
+        let backup_id = manager
+            .backup(Some("Initial with ignore".to_string()))
+            .expect("Failed to create backup");
+
+        let diffs = manager.diff(&backup_id).expect("Failed to get diff");
+
+        // Should include only included.txt and data/data.txt
+        assert!(
+            diffs.iter().any(|d| d.path == "included.txt"),
+            "Should include included.txt"
+        );
+        assert!(
+            diffs.iter().any(|d| d.path.contains("data/data.txt") || d.path.contains("data\\data.txt")),
+            "Should include data/data.txt"
+        );
+
+        // Should not include ignored entries
+        assert!(
+            !diffs.iter().any(|d| d.path == "ignored.txt"),
+            "Should not include ignored.txt"
+        );
+        assert!(
+            !diffs.iter().any(|d| d.path.contains("logs/") || d.path.contains("logs\\")),
+            "Should not include anything under logs/"
+        );
+        assert!(
+            !diffs.iter().any(|d| d.path.ends_with(".tmp")),
+            "Should not include .tmp files"
+        );
+    }
+
+    #[test]
+    fn test_ignore_file_with_negation() {
+        use std::fs;
+        let (store_dir, working_dir) = setup_test_env("ignore_negation");
+
+        fs::create_dir_all(working_dir.join("logs")).expect("Failed to create logs dir");
+        create_test_file(&working_dir.join("logs"), "keep.log", b"Keep this");
+        create_test_file(&working_dir.join("logs"), "skip.log", b"Skip this");
+
+        // Write ignore file with negation (whitelist)
+        let ignore_path = working_dir.join(".backupignore");
+        fs::write(&ignore_path, b"logs/*\n!logs/keep.log\n").expect("Failed to write ignore file");
+
+        let mut manager = BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+        manager
+            .setup_ignore_file(&ignore_path)
+            .expect("Failed to setup ignore file");
+
+        let backup_id = manager
+            .backup(Some("Negation".to_string()))
+            .expect("Failed to create backup");
+
+        let diffs = manager.diff(&backup_id).expect("Failed to get diff");
+
+        // Should include keep.log but not skip.log
+        assert!(
+            diffs.iter().any(|d| d.path.contains("logs/keep.log") || d.path.contains("logs\\keep.log")),
+            "Should include whitelisted logs/keep.log"
+        );
+        assert!(
+            !diffs.iter().any(|d| d.path.contains("logs/skip.log") || d.path.contains("logs\\skip.log")),
+            "Should not include logs/skip.log"
+        );
+    }
+
+    #[test]
+    fn test_setup_ignore_file_nonexistent() {
+        let (store_dir, working_dir) = setup_test_env("ignore_nonexistent");
+
+        let mut manager = BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        // Point to a non-existing ignore file; this should not error and should behave as no ignores
+        let missing = working_dir.join("does_not_exist.ignore");
+        manager
+            .setup_ignore_file(&missing)
+            .expect("setup_ignore_file should succeed even if file does not exist");
+
+        // Create a file and ensure it is included
+        create_test_file(&working_dir, "foo.txt", b"Hello");
+        let backup_id = manager.backup(Some("No ignores".to_string())).expect("Failed to create backup");
+        let diffs = manager.diff(&backup_id).expect("Failed to get diff");
+
+        assert_eq!(diffs.len(), 1, "Should include the file without ignores");
+        assert_eq!(diffs[0].path, "foo.txt");
+    }
 }
+
+

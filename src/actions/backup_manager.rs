@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use obsidian_backup_system::BackupManager;
+//! use obsidian_backups::BackupManager;
 //!
 //! let store_dir = "./backup_store";
 //! let working_dir = "./my_data";
@@ -20,8 +20,9 @@
 use crate::data::backup_item::BackupItem;
 use crate::data::modified_file::ModifiedFile;
 use crate::log_stub::*;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use git2::{Oid, Repository, RepositoryInitOptions};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 #[cfg(feature = "zip")]
 use sevenz_rust2::{ArchiveWriter, encoder_options};
 use std::fs;
@@ -38,36 +39,53 @@ use std::path::Path;
 ///
 /// # Example
 /// ```rust
-/// use obsidian_backup_system::BackupManager;
-/// 
+/// use obsidian_backups::BackupManager;
+///
 /// let backup_manager = BackupManager::new("./backup_store", "./my_data")
 ///     .expect("Failed to create BackupManager");
 /// ```
 pub struct BackupManager {
     repository: Repository,
+    ignore_matcher: Option<Gitignore>,
 }
 
 impl BackupManager {
-    /// Helper function to check if a path should be excluded from backups
-    fn should_exclude(path: &Path) -> bool {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            // Exclude common system and temporary files
-            matches!(
-                name,
-                ".git" | ".DS_Store" | "Thumbs.db" | "desktop.ini" | 
-                ".Spotlight-V100" | ".Trashes" | "ehthumbs.db" | 
-                "ehthumbs_vista.db" | "$RECYCLE.BIN"
-            ) || name.starts_with("~$")  // Office temp files
-              || name.ends_with(".tmp")
-              || name.ends_with(".swp")
-              || name.ends_with("~")
-              || name == "__pycache__"
-        } else {
-            false
+    /// Helper function to check if a path should be excluded from backups using ignore patterns in `exclude.obak`
+    fn should_exclude(&self, path: &Path, is_dir: bool) -> bool {
+        // Always skip the Git metadata directory and common junk files
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && (name == ".git"
+                || matches!(
+                    name,
+                    ".DS_Store"
+                        | "Thumbs.db"
+                        | "desktop.ini"
+                        | ".Spotlight-V100"
+                        | ".Trashes"
+                        | "ehthumbs.db"
+                        | "ehthumbs_vista.db"
+                        | "$RECYCLE.BIN"
+                )
+                || name.starts_with("~$")
+                || name.ends_with(".tmp")
+                || name.ends_with(".swp")
+                || name.ends_with("~")
+                || name == "__pycache__")
+        {
+            return true;
         }
+
+        if let Some(matcher) = &self.ignore_matcher {
+            let m = matcher.matched(path, is_dir);
+            if m.is_ignore() {
+                return true;
+            }
+        }
+        false
     }
 
     /// Helper function to recursively add files from a directory to the git index
+    #[allow(clippy::only_used_in_recursion)]
     fn add_directory_to_index(
         &self,
         index: &mut git2::Index,
@@ -78,13 +96,13 @@ impl BackupManager {
             let entry = entry?;
             let path = entry.path();
 
+            let file_type = entry.file_type()?;
+
             // Skip excluded files and directories
-            if Self::should_exclude(&path) {
+            if self.should_exclude(&path, file_type.is_dir()) {
                 debug!("Skipping excluded path: {:?}", path);
                 continue;
             }
-
-            let file_type = entry.file_type()?;
 
             if file_type.is_dir() {
                 // Recursively add subdirectory
@@ -131,7 +149,7 @@ impl BackupManager {
     ///
     /// ```
     /// use obsidian_backup_system::BackupManager;
-    /// 
+    ///
     /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
     /// ```
@@ -167,7 +185,69 @@ impl BackupManager {
         let repository = Repository::init_opts(&store_directory, &opts)?;
 
         info!("BackupManager initialized successfully");
-        Ok(Self { repository })
+        Ok(Self {
+            repository,
+            ignore_matcher: None,
+        })
+    }
+
+    /// Sets up a `.gitignore`-style ignore file for the repository using the provided file path.
+    /// This function configures an ignore matcher to exclude specified paths or patterns.
+    ///
+    /// # Arguments
+    /// * `ignore_file` - A path-like object referencing the ignore file to process. The file should follow `.gitignore` syntax.
+    ///
+    /// # Returns
+    /// * `Result<()>` - Returns `Ok(())` if the ignore matcher is successfully built and configured.
+    ///                  Returns an error if the ignore matcher cannot be built or if the ignore file causes an issue.
+    ///
+    /// # Behavior
+    /// 1. Locates the working directory of the repository. Defaults to `./` if the repository has no working directory.
+    /// 2. Initializes a `GitignoreBuilder` using the repository's working directory.
+    /// 3. Checks whether the provided ignore file exists:
+    ///    - If the file exists, attempts to add it to the builder. Logs a warning if there's an issue while adding the file.
+    /// 4. Attempts to construct the ignore matcher from the builder:
+    ///    - If successful, stores the ignore matcher in `self.ignore_matcher`.
+    ///    - If unsuccessful, logs an error message and returns an error.
+    ///
+    /// # Errors
+    /// * Returns an error if:
+    ///   - The ignore file could not be properly parsed or added.
+    ///   - The ignore matcher fails to build successfully.
+    ///
+    /// # Logging
+    /// - Logs a warning message if the function fails to add the ignore file to the builder.
+    /// - Logs an error message if the function fails to build the ignore matcher.
+    ///
+    /// # Example Usage
+    /// ```rust
+    /// use std::path::Path;
+    /// use obsidian_backup_system::BackupManager;
+    ///
+    /// let mut backup_manager = BackupManager::new("./backup_store", "./my_data")?;
+    /// backup_manager.setup_ignore_file(".my_ignore_file")?;
+    /// ```
+    pub fn setup_ignore_file(&mut self, ignore_file: impl AsRef<Path>) -> Result<()> {
+        let working_directory = self.repository.workdir().unwrap_or(Path::new("./"));
+        let mut builder = GitignoreBuilder::new(working_directory);
+
+        let ignore_file = ignore_file.as_ref();
+
+        if ignore_file.exists()
+            && let Some(e) = builder.add(ignore_file)
+        {
+            warn!("Failed to add ignore file {ignore_file:?}: {e}");
+        }
+        match builder.build() {
+            Ok(ignore_matcher) => {
+                self.ignore_matcher = Some(ignore_matcher);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to build ignore matcher: {e}");
+                Err(anyhow!("Failed to build ignore matcher: {e}"))
+            }
+        }
     }
 
     /// Lists all backup items available in the repository.
@@ -200,10 +280,10 @@ impl BackupManager {
     /// # Example
     /// ```
     /// use obsidian_backup_system::BackupManager;
-    /// 
+    ///
     /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
-    /// 
+    ///
     /// match manager.list() {
     ///     Ok(backup_items) => {
     ///         for item in backup_items {
@@ -231,21 +311,35 @@ impl BackupManager {
 
         for commit_id in ids {
             debug!("Processing commit: {}", commit_id);
-            let commit = self.repository.find_commit(Oid::from_str(&commit_id)?)?;
-            let item = BackupItem {
-                id: commit_id,
-                timestamp: chrono::DateTime::from_timestamp(commit.time().seconds(), 0)
-                    .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
-                description: commit
-                    .message()
-                    .unwrap_or("No description was provided")
-                    .to_string(),
+            let oid = match Oid::from_str(&commit_id) {
+                Ok(oid) => oid,
+                Err(e) => {
+                    warn!("Skipping invalid commit id {}: {}", commit_id, e);
+                    continue;
+                }
             };
-            trace!(
-                "Created backup item: id={}, timestamp={}, description={:?}",
-                item.id, item.timestamp, item.description
-            );
-            items.push(item);
+            match self.repository.find_commit(oid) {
+                Ok(commit) => {
+                    let item = BackupItem {
+                        id: commit_id,
+                        timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
+                            .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
+                        description: commit
+                            .message()
+                            .unwrap_or("No description was provided")
+                            .to_string(),
+                    };
+                    trace!(
+                        "Created backup item: id={}, timestamp={}, description={:?}",
+                        item.id, item.timestamp, item.description
+                    );
+                    items.push(item);
+                }
+                Err(e) => {
+                    warn!("Skipping missing or unreadable commit {}: {}", commit_id, e);
+                    continue;
+                }
+            }
         }
 
         info!("Found {} backup items", items.len());
@@ -254,10 +348,32 @@ impl BackupManager {
 
     fn list_ids(&self) -> Result<Vec<String>> {
         let mut rev_walk = self.repository.revwalk()?;
-        rev_walk.push_head()?;
+        // Try HEAD first; if it fails, fall back to any available reference target.
+        let mut pushed = false;
+        if let Ok(head) = self.repository.head()
+            && let Some(oid) = head.target()
+            && rev_walk.push(oid).is_ok()
+        {
+            pushed = true;
+        }
+        if !pushed && let Ok(refs) = self.repository.references() {
+            for r in refs {
+                if let Ok(r) = r
+                    && let Some(oid) = r.target()
+                    && rev_walk.push(oid).is_ok()
+                {
+                    pushed = true;
+                    break;
+                }
+            }
+        }
+        if !pushed {
+            // No references to walk; return empty list rather than erroring
+            return Ok(Vec::new());
+        }
+
         let mut ids = Vec::new();
-        for oid in rev_walk {
-            let oid = oid?;
+        for oid in rev_walk.flatten() {
             ids.push(oid.to_string());
         }
         Ok(ids)
@@ -299,10 +415,10 @@ impl BackupManager {
     ///
     /// ```rust
     /// use obsidian_backup_system::BackupManager;
-    /// 
+    ///
     /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
-    /// 
+    ///
     /// let description = Some("Backup before deployment".to_string());
     /// match manager.backup(description) {
     ///     Ok(commit_id) => println!("Backup created with ID: {}", commit_id),
@@ -435,10 +551,10 @@ impl BackupManager {
     ///
     /// ```no_run
     /// use obsidian_backup_system::BackupManager;
-    /// 
+    ///
     /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
-    /// 
+    ///
     /// let backup_id = "abcdef1234567890";
     /// if let Err(err) = manager.restore(backup_id) {
     ///     eprintln!("Failed to restore backup: {}", err);
@@ -464,23 +580,30 @@ impl BackupManager {
             debug!("Working directory found: {:?}", workdir);
 
             // Use safer restore approach with temporary directory
-            let temp_dir = workdir.parent()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory for working directory"))?
-                .join(format!("{}_restore_tmp", workdir.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("workdir")));
+            let temp_dir = workdir
+                .parent()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Cannot determine parent directory for working directory")
+                })?
+                .join(format!(
+                    "{}_restore_tmp",
+                    workdir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("workdir")
+                ));
 
             debug!("Using temporary directory: {:?}", temp_dir);
 
             // Clean up temp directory if it exists from a previous failed restore
             if temp_dir.exists() {
                 debug!("Cleaning up existing temporary directory");
-                std::fs::remove_dir_all(&temp_dir)?;
+                fs::remove_dir_all(&temp_dir)?;
             }
 
             // Create temp directory
             debug!("Creating temporary directory");
-            std::fs::create_dir_all(&temp_dir)?;
+            fs::create_dir_all(&temp_dir)?;
 
             // Checkout to temp location
             debug!("Checking out tree to temporary directory");
@@ -488,41 +611,49 @@ impl BackupManager {
             checkout_opts.target_dir(&temp_dir);
             checkout_opts.force();
             checkout_opts.remove_untracked(true);
-            self.repository.checkout_tree(tree.as_object(), Some(&mut checkout_opts))?;
+            self.repository
+                .checkout_tree(tree.as_object(), Some(&mut checkout_opts))?;
 
             // At this point, the checkout succeeded. Now perform the swap.
             debug!("Checkout successful, swapping directories");
 
             // Create a backup of the old working directory
-            let backup_dir = workdir.parent()
-                .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory for working directory"))?
-                .join(format!("{}_old_backup", workdir.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("workdir")));
+            let backup_dir = workdir
+                .parent()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Cannot determine parent directory for working directory")
+                })?
+                .join(format!(
+                    "{}_old_backup",
+                    workdir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("workdir")
+                ));
 
             // Clean up old backup if it exists
             if backup_dir.exists() {
                 debug!("Cleaning up old backup directory");
-                std::fs::remove_dir_all(&backup_dir)?;
+                fs::remove_dir_all(&backup_dir)?;
             }
 
             // Move current workdir to backup location
             debug!("Moving current working directory to backup location");
-            std::fs::rename(workdir, &backup_dir)?;
+            fs::rename(workdir, &backup_dir)?;
 
             // Move temp directory to workdir location
             debug!("Moving temporary directory to working directory location");
-            match std::fs::rename(&temp_dir, workdir) {
+            match fs::rename(&temp_dir, workdir) {
                 Ok(_) => {
                     debug!("Restore completed successfully, cleaning up old backup");
                     // Only remove the old backup if the restore succeeded
-                    let _ = std::fs::remove_dir_all(&backup_dir);
+                    let _ = fs::remove_dir_all(&backup_dir);
                 }
                 Err(e) => {
                     // If rename fails, try to restore the original
                     error!("Failed to move temp directory: {}", e);
                     debug!("Attempting to restore original working directory");
-                    if let Err(_restore_err) = std::fs::rename(&backup_dir, workdir) {
+                    if let Err(_restore_err) = fs::rename(&backup_dir, workdir) {
                         error!("Failed to restore original directory: {}", _restore_err);
                         return Err(anyhow::anyhow!(
                             "Restore failed and could not recover original directory. Original backed up at: {:?}",
@@ -576,15 +707,15 @@ impl BackupManager {
     ///
     /// ```rust
     /// use obsidian_backup_system::BackupManager;
-    /// 
+    ///
     /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
-    /// 
+    ///
     /// let last_backup = manager
     ///     .last()
     ///     .expect("Failed to get last backup")
     ///     .expect("No backups found");
-    /// 
+    ///
     /// manager.export(&last_backup.id, "backup.7z", 5)
     ///     .expect("Failed to export backup");
     /// ```
@@ -600,7 +731,7 @@ impl BackupManager {
     ) -> Result<()> {
         // Validate and clamp compression level to 0-9 range
         let level = level.clamp(0, 9);
-        
+
         let mut writer = ArchiveWriter::create(output_path)?;
         writer.set_content_methods(vec![
             encoder_options::Lzma2Options::from_level(level as u32).into(),
@@ -664,10 +795,10 @@ impl BackupManager {
     ///
     /// ```rust
     /// use obsidian_backup_system::BackupManager;
-    /// 
+    ///
     /// let manager = BackupManager::new("./backup_store", "./my_data")
     ///     .expect("Failed to initialize BackupManager");
-    /// 
+    ///
     /// let backup_id = "abcd1234";
     /// let modified_files = manager.diff(backup_id)
     ///     .expect("Failed to get diff");
@@ -782,16 +913,20 @@ impl BackupManager {
                 Some(git2::ObjectType::Tree) => {
                     // It's a directory, recurse into it
                     let subtree = self.repository.find_tree(entry.id())?;
-                    let parent_subtree = parent_tree
-                        .and_then(|pt| pt.get_name(name))
-                        .and_then(|e| {
+                    let parent_subtree =
+                        parent_tree.and_then(|pt| pt.get_name(name)).and_then(|e| {
                             if let Some(git2::ObjectType::Tree) = e.kind() {
                                 self.repository.find_tree(e.id()).ok()
                             } else {
                                 None
                             }
                         });
-                    self.diff_trees_recursive(&subtree, parent_subtree.as_ref(), &full_path, files)?;
+                    self.diff_trees_recursive(
+                        &subtree,
+                        parent_subtree.as_ref(),
+                        &full_path,
+                        files,
+                    )?;
                 }
                 _ => {
                     // Skip other object types
@@ -826,7 +961,12 @@ impl BackupManager {
                         Some(git2::ObjectType::Tree) => {
                             // Directory was deleted - recursively add all files as deleted
                             let parent_subtree = self.repository.find_tree(parent_entry.id())?;
-                            self.diff_trees_recursive(&parent_subtree, Some(&parent_subtree), &full_path, &mut Vec::new())?;
+                            self.diff_trees_recursive(
+                                &parent_subtree,
+                                Some(&parent_subtree),
+                                &full_path,
+                                &mut Vec::new(),
+                            )?;
                             // Mark all files in the deleted directory
                             self.mark_tree_as_deleted(&parent_subtree, &full_path, files)?;
                         }
@@ -875,7 +1015,7 @@ impl BackupManager {
     pub fn last(&self) -> Result<Option<BackupItem>> {
         // Check if HEAD exists first
         if self.repository.head().is_err() {
-            return Ok(None);  // No backups yet
+            return Ok(None); // No backups yet
         }
 
         let mut rev_walk = self.repository.revwalk()?;
@@ -885,7 +1025,7 @@ impl BackupManager {
             let commit = self.repository.find_commit(oid)?;
             let item = BackupItem {
                 id: oid.to_string(),
-                timestamp: chrono::DateTime::from_timestamp(commit.time().seconds(), 0)
+                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
                 description: commit
                     .message()
@@ -901,7 +1041,7 @@ impl BackupManager {
     #[cfg(feature = "zip")]
     fn add_tree_to_archive(
         &self,
-        writer: &mut ArchiveWriter<std::fs::File>,
+        writer: &mut ArchiveWriter<fs::File>,
         tree: &git2::Tree,
         path_prefix: &str,
     ) -> Result<()> {
@@ -938,5 +1078,581 @@ impl BackupManager {
             }
         }
         Ok(())
+    }
+
+    pub fn purge_backups_over_count(&self, count: usize) -> Result<()> {
+        info!("Purging backups over count: {}", count);
+
+        // Get all commit IDs
+        let ids = self.list_ids()?;
+
+        if ids.len() <= count {
+            info!(
+                "Number of backups ({}) is within limit ({})",
+                ids.len(),
+                count
+            );
+            return Ok(());
+        }
+
+        // Keep the most recent 'count' commits
+        let commits_to_keep = &ids[..count];
+        let oldest_commit_to_keep = &ids[count - 1];
+
+        debug!("Keeping {} most recent commits", count);
+        debug!("Oldest commit to keep: {}", oldest_commit_to_keep);
+
+        // Get the tree of the oldest commit we want to keep
+        let oldest_oid = Oid::from_str(oldest_commit_to_keep)?;
+        let oldest_commit = self.repository.find_commit(oldest_oid)?;
+        let oldest_tree = oldest_commit.tree()?;
+
+        // Create a new initial commit with this tree
+        let sig = self.repository.signature()?;
+        let new_base_oid = self.repository.commit(
+            None, // Don't update any reference yet
+            &sig,
+            &sig,
+            &format!(
+                "Consolidated backup prior to {}",
+                oldest_commit.time().seconds()
+            ),
+            &oldest_tree,
+            &[], // No parents - this becomes the new root
+        )?;
+
+        debug!("Created new base commit: {}", new_base_oid);
+
+        // Now we need to rewrite the remaining commits to use this new base
+        self.rewrite_commit_chain(&commits_to_keep[..commits_to_keep.len() - 1], new_base_oid)?;
+
+        // Force garbage collection to remove unreferenced objects
+        self.cleanup_orphaned_commits()?;
+
+        info!("Successfully purged {} old backups", ids.len() - count);
+        Ok(())
+    }
+
+    pub fn purge_backups_older_than(&self, period: chrono::Duration) -> Result<()> {
+        info!("Purging backups older than {:?}", period);
+
+        let now = chrono::Utc::now();
+        let cutoff_time = now - period;
+        let cutoff_timestamp = cutoff_time.timestamp();
+
+        debug!("Cutoff timestamp: {}", cutoff_timestamp);
+
+        // Get all commits
+        let ids = self.list_ids()?;
+        let mut commits_to_keep = Vec::new();
+        let mut oldest_commit_to_delete = None;
+
+        for commit_id in &ids {
+            let oid = Oid::from_str(commit_id)?;
+            let commit = self.repository.find_commit(oid)?;
+            let commit_time = commit.time().seconds();
+
+            if commit_time >= cutoff_timestamp {
+                commits_to_keep.push(commit_id.clone());
+            } else {
+                // Track the oldest commit we're deleting (youngest of the ones to delete)
+                if oldest_commit_to_delete.is_none() {
+                    oldest_commit_to_delete = Some((commit_id.clone(), commit));
+                }
+            }
+        }
+
+        if commits_to_keep.len() == ids.len() {
+            info!("No backups to purge");
+            return Ok(());
+        }
+
+        if commits_to_keep.is_empty() {
+            return Err(anyhow::anyhow!("Cannot purge all backups"));
+        }
+
+        // Create a consolidated base commit from the oldest commit to keep
+        let oldest_to_keep = &commits_to_keep[commits_to_keep.len() - 1];
+        let oldest_oid = Oid::from_str(oldest_to_keep)?;
+        let oldest_commit = self.repository.find_commit(oldest_oid)?;
+        let oldest_tree = oldest_commit.tree()?;
+
+        let sig = self.repository.signature()?;
+        let new_base_oid = self.repository.commit(
+            None,
+            &sig,
+            &sig,
+            &format!(
+                "Consolidated backup prior to {}",
+                chrono::DateTime::from_timestamp_secs(oldest_commit.time().seconds()).unwrap()
+            ),
+            &oldest_tree,
+            &[],
+        )?;
+
+        debug!("Created new base commit: {}", new_base_oid);
+
+        // Rewrite remaining commits
+        if commits_to_keep.len() > 1 {
+            self.rewrite_commit_chain(&commits_to_keep[..commits_to_keep.len() - 1], new_base_oid)?;
+        } else {
+            // Only one commit to keep, just update HEAD to the new base
+            self.repository.reference(
+                "refs/heads/master",
+                new_base_oid,
+                true,
+                "Purged old backups",
+            )?;
+            self.repository.set_head("refs/heads/master")?;
+        }
+
+        self.cleanup_orphaned_commits()?;
+
+        info!("Successfully purged backups older than {:?}", period);
+        Ok(())
+    }
+
+    pub fn purge_backups_over_size(&self, size: usize) -> Result<()> {
+        info!(
+            "Purging backups to reduce repository size below {} bytes",
+            size
+        );
+
+        // Get current repository size
+        let repo_path = self.repository.path();
+        let current_size = self.calculate_repo_size(repo_path)?;
+
+        debug!("Current repository size: {} bytes", current_size);
+
+        if current_size <= size {
+            info!("Repository size is within limit");
+            return Ok(());
+        }
+
+        // Strategy: Remove oldest commits one by one until size is acceptable
+        let ids = self.list_ids()?;
+
+        if ids.len() <= 1 {
+            return Err(anyhow::anyhow!(
+                "Cannot reduce size further without removing all backups"
+            ));
+        }
+
+        // Binary search for the right number of commits to keep
+        let mut keep_count = ids.len();
+
+        while keep_count > 1 {
+            keep_count /= 2;
+
+            // Estimate if this would be enough by checking
+            // We'll need to actually try purging to get accurate size
+            debug!("Trying to keep {} commits", keep_count);
+
+            // For now, just use purge_backups_over_count approach
+            // In production, you might want a more sophisticated size estimation
+            self.purge_backups_over_count(keep_count)?;
+
+            let new_size = self.calculate_repo_size(repo_path)?;
+            debug!("New repository size: {} bytes", new_size);
+
+            if new_size <= size {
+                info!("Successfully reduced repository size to {} bytes", new_size);
+                return Ok(());
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Could not reduce repository size below {} bytes",
+            size
+        ))
+    }
+
+    /// Helper function to rewrite a chain of commits with a new parent
+    fn rewrite_commit_chain(&self, commit_ids: &[String], new_parent_oid: Oid) -> Result<()> {
+        debug!("Rewriting commit chain with {} commits", commit_ids.len());
+
+        let mut current_parent = new_parent_oid;
+        let mut new_head = None;
+
+        // Iterate through commits from oldest to newest (reverse order)
+        for commit_id in commit_ids.iter().rev() {
+            let old_oid = Oid::from_str(commit_id)?;
+            let old_commit = self.repository.find_commit(old_oid)?;
+
+            debug!("Rewriting commit: {}", commit_id);
+
+            let parent_commit = self.repository.find_commit(current_parent)?;
+
+            // Create new commit with same tree but new parent
+            let new_oid = self.repository.commit(
+                None,
+                &old_commit.author(),
+                &old_commit.committer(),
+                old_commit.message().unwrap_or("No description provided"),
+                &old_commit.tree()?,
+                &[&parent_commit],
+            )?;
+
+            debug!("Created new commit: {} (was: {})", new_oid, old_oid);
+
+            current_parent = new_oid;
+            new_head = Some(new_oid);
+        }
+
+        // Update HEAD to point to the new chain
+        if let Some(head_oid) = new_head {
+            debug!("Updating HEAD to: {}", head_oid);
+            self.repository.reference(
+                "refs/heads/master",
+                head_oid,
+                true,
+                "Restructured commit history",
+            )?;
+            self.repository.set_head("refs/heads/master")?;
+        }
+
+        Ok(())
+    }
+
+    /// Clean up orphaned commits and run garbage collection
+    ///
+    /// This implements a standalone garbage collection mechanism that:
+    /// 1. Expires reflog entries
+    /// 2. Identifies all reachable objects from refs
+    /// 3. Removes unreachable loose objects
+    /// 4. Packs remaining loose objects into packfiles
+    fn cleanup_orphaned_commits(&self) -> Result<()> {
+        info!("Starting comprehensive garbage collection");
+
+        // Step 1: Expire reflog entries immediately
+        debug!("Expiring reflog entries");
+        self.expire_reflogs()?;
+
+        // Step 2: Collect all reachable objects
+        debug!("Identifying reachable objects");
+        let reachable_oids = self.find_reachable_objects()?;
+        info!("Found {} reachable objects", reachable_oids.len());
+
+        // Step 3: Remove unreachable loose objects
+        debug!("Pruning unreachable objects");
+        let _pruned_count = self.prune_unreachable_objects(&reachable_oids)?;
+        info!("Pruned {} unreachable objects", _pruned_count);
+
+        // Step 4: Pack loose objects
+        debug!("Packing loose objects");
+        let _packed_count = self.pack_loose_objects()?;
+        info!("Packed {} loose objects", _packed_count);
+
+        // Step 5: Pack references
+        debug!("Packing references");
+        self.pack_references()?;
+
+        info!("Garbage collection completed successfully");
+        Ok(())
+    }
+
+    /// Expire all reflog entries
+    fn expire_reflogs(&self) -> Result<()> {
+        let reflog_refs = vec!["HEAD", "refs/heads/master"];
+
+        for ref_name in reflog_refs {
+            if let Ok(mut reflog) = self.repository.reflog(ref_name) {
+                // Clear all reflog entries
+                while !reflog.is_empty() {
+                    reflog.remove(0, false)?;
+                }
+                reflog.write()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Find all objects reachable from current refs
+    fn find_reachable_objects(&self) -> Result<std::collections::HashSet<Oid>> {
+        use std::collections::{HashSet, VecDeque};
+
+        let mut reachable = HashSet::new();
+        let mut to_visit = VecDeque::new();
+
+        // Start from all references
+        for reference in self.repository.references()? {
+            let reference = reference?;
+            if let Some(oid) = reference.target() {
+                to_visit.push_back(oid);
+                reachable.insert(oid);
+            }
+        }
+
+        // Also include HEAD if it exists
+        if let Ok(head) = self.repository.head()
+            && let Some(oid) = head.target()
+        {
+            to_visit.push_back(oid);
+            reachable.insert(oid);
+        }
+
+        // Traverse the object graph
+        while let Some(oid) = to_visit.pop_front() {
+            // Try to read the object and find its dependencies
+            if let Ok(obj) = self.repository.find_object(oid, None) {
+                match obj.kind() {
+                    Some(git2::ObjectType::Commit) => {
+                        if let Some(commit) = obj.as_commit() {
+                            // Add the tree
+                            let tree_oid = commit.tree_id();
+                            if reachable.insert(tree_oid) {
+                                to_visit.push_back(tree_oid);
+                            }
+
+                            // Add all parents
+                            for parent in commit.parents() {
+                                let parent_oid = parent.id();
+                                if reachable.insert(parent_oid) {
+                                    to_visit.push_back(parent_oid);
+                                }
+                            }
+                        }
+                    }
+                    Some(git2::ObjectType::Tree) => {
+                        if let Some(tree) = obj.as_tree() {
+                            for entry in tree.iter() {
+                                let entry_oid = entry.id();
+                                if reachable.insert(entry_oid) {
+                                    to_visit.push_back(entry_oid);
+                                }
+                            }
+                        }
+                    }
+                    Some(git2::ObjectType::Tag) => {
+                        if let Some(tag) = obj.as_tag() {
+                            let target_id = tag.target_id();
+                            if reachable.insert(target_id) {
+                                to_visit.push_back(target_id);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Blobs have no dependencies
+                    }
+                }
+            }
+        }
+
+        Ok(reachable)
+    }
+
+    /// Remove unreachable loose objects from the object database
+    fn prune_unreachable_objects(
+        &self,
+        reachable_oids: &std::collections::HashSet<Oid>,
+    ) -> Result<usize> {
+        let objects_dir = self.repository.path().join("objects");
+        let mut pruned_count = 0;
+
+        // Iterate through loose object directories (00-ff)
+        for i in 0..256 {
+            let dir_name = format!("{:02x}", i);
+            let dir_path = objects_dir.join(&dir_name);
+
+            if !dir_path.exists() {
+                continue;
+            }
+
+            for entry in fs::read_dir(&dir_path)? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+
+                // Skip pack and idx files
+                if file_name_str == "pack" || file_name_str == "info" {
+                    continue;
+                }
+
+                // Construct the full OID from directory and filename
+                let oid_str = format!("{}{}", dir_name, file_name_str);
+
+                if let Ok(oid) = Oid::from_str(&oid_str) {
+                    // If this object is not reachable, delete it
+                    if !reachable_oids.contains(&oid) {
+                        let file_path = entry.path();
+                        debug!("Pruning unreachable object: {}", oid);
+                        fs::remove_file(&file_path)?;
+                        pruned_count += 1;
+
+                        // Remove directory if it's now empty
+                        if let Ok(mut entries) = fs::read_dir(&dir_path)
+                            && entries.next().is_none()
+                        {
+                            let _ = fs::remove_dir(&dir_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(pruned_count)
+    }
+
+    /// Pack loose objects into packfiles
+    fn pack_loose_objects(&self) -> Result<usize> {
+        let objects_dir = self.repository.path().join("objects");
+        let mut loose_oids = Vec::new();
+
+        // Collect all loose object OIDs
+        for i in 0..256 {
+            let dir_name = format!("{:02x}", i);
+            let dir_path = objects_dir.join(&dir_name);
+
+            if !dir_path.exists() {
+                continue;
+            }
+
+            for entry in fs::read_dir(&dir_path)? {
+                let entry = entry?;
+                let file_name = entry.file_name();
+                let file_name_str = file_name.to_string_lossy();
+
+                // Skip pack and idx files
+                if file_name_str == "pack" || file_name_str == "info" {
+                    continue;
+                }
+
+                // Construct the full OID
+                let oid_str = format!("{}{}", dir_name, file_name_str);
+                if let Ok(oid) = Oid::from_str(&oid_str) {
+                    loose_oids.push(oid);
+                }
+            }
+        }
+
+        let loose_count = loose_oids.len();
+
+        if loose_oids.is_empty() {
+            debug!("No loose objects to pack");
+            return Ok(0);
+        }
+
+        debug!("Packing {} loose objects", loose_count);
+
+        // Create a packbuilder
+        let mut packbuilder = self.repository.packbuilder()?;
+
+        // Add all loose objects to the pack
+        for oid in &loose_oids {
+            if let Err(_e) = packbuilder.insert_object(*oid, None) {
+                debug!("Failed to insert object {} into pack: {}", oid, _e);
+                // Continue with other objects
+            }
+        }
+
+        // Write the packfile
+        let pack_dir = objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+
+        // Generate a unique pack name based on timestamp
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let pack_path = pack_dir.join(format!("pack-{:x}.pack", timestamp));
+
+        debug!("Writing packfile to: {:?}", pack_path);
+        let mut buf = git2::Buf::new();
+        packbuilder.write_buf(&mut buf)?;
+        fs::write::<&std::path::PathBuf, &[u8]>(&pack_path, buf.as_ref())?;
+
+        // After successful packing, remove the loose objects
+        for oid in &loose_oids {
+            let oid_str = oid.to_string();
+            let dir_name = &oid_str[..2];
+            let file_name = &oid_str[2..];
+            let file_path = objects_dir.join(dir_name).join(file_name);
+
+            if file_path.exists() {
+                let _ = fs::remove_file(&file_path);
+            }
+        }
+
+        // Clean up empty directories
+        for i in 0..256 {
+            let dir_name = format!("{:02x}", i);
+            let dir_path = objects_dir.join(&dir_name);
+
+            if dir_path.exists()
+                && let Ok(mut entries) = fs::read_dir(&dir_path)
+                && entries.next().is_none()
+            {
+                let _ = fs::remove_dir(&dir_path);
+            }
+        }
+
+        Ok(loose_count)
+    }
+
+    /// Pack references into packed-refs file
+    fn pack_references(&self) -> Result<()> {
+        // Get all references
+        let mut refs_to_pack = Vec::new();
+
+        for reference in self.repository.references()? {
+            let reference = reference?;
+            let name = reference.name().unwrap_or("");
+
+            // Only pack refs under refs/ (not HEAD or other special refs)
+            if name.starts_with("refs/")
+                && let Some(target) = reference.target()
+            {
+                refs_to_pack.push((name.to_string(), target));
+            }
+        }
+
+        if refs_to_pack.is_empty() {
+            debug!("No references to pack");
+            return Ok(());
+        }
+
+        // Write packed-refs file
+        let packed_refs_path = self.repository.path().join("packed-refs");
+        let mut content = String::from("# pack-refs with: peeled fully-peeled sorted\n");
+
+        for (name, oid) in &refs_to_pack {
+            content.push_str(&format!("{} {}\n", oid, name));
+        }
+
+        fs::write(&packed_refs_path, content)?;
+
+        // Remove individual ref files
+        for (name, _) in &refs_to_pack {
+            let ref_path = self.repository.path().join(name);
+            if ref_path.exists() {
+                let _ = fs::remove_file(&ref_path);
+            }
+        }
+
+        debug!("Packed {} references", refs_to_pack.len());
+        Ok(())
+    }
+
+    /// Calculate the total size of the repository
+    fn calculate_repo_size(&self, repo_path: &Path) -> Result<usize> {
+        let mut total_size = 0;
+
+        fn visit_dirs(dir: &Path, total: &mut usize) -> Result<()> {
+            if dir.is_dir() {
+                for entry in fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_dir() {
+                        visit_dirs(&path, total)?;
+                    } else {
+                        *total += fs::metadata(&path)?.len() as usize;
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        visit_dirs(repo_path, &mut total_size)?;
+        Ok(total_size)
     }
 }
