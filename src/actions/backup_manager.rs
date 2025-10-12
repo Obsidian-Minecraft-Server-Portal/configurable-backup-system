@@ -579,90 +579,17 @@ impl BackupManager {
         if let Some(ref workdir) = self.repository.workdir() {
             debug!("Working directory found: {:?}", workdir);
 
-            // Use safer restore approach with temporary directory
-            let temp_dir = workdir
-                .parent()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Cannot determine parent directory for working directory")
-                })?
-                .join(format!(
-                    "{}_restore_tmp",
-                    workdir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("workdir")
-                ));
-
-            debug!("Using temporary directory: {:?}", temp_dir);
-
-            // Clean up temp directory if it exists from a previous failed restore
-            if temp_dir.exists() {
-                debug!("Cleaning up existing temporary directory");
-                fs::remove_dir_all(&temp_dir)?;
-            }
-
-            // Create temp directory
-            debug!("Creating temporary directory");
-            fs::create_dir_all(&temp_dir)?;
-
-            // Checkout to temp location
-            debug!("Checking out tree to temporary directory");
+            // Checkout directly to the working directory
+            debug!("Checking out tree to working directory");
             let mut checkout_opts = git2::build::CheckoutBuilder::new();
-            checkout_opts.target_dir(&temp_dir);
             checkout_opts.force();
             checkout_opts.remove_untracked(true);
+            checkout_opts.recreate_missing(true);
+
             self.repository
                 .checkout_tree(tree.as_object(), Some(&mut checkout_opts))?;
 
-            // At this point, the checkout succeeded. Now perform the swap.
-            debug!("Checkout successful, swapping directories");
-
-            // Create a backup of the old working directory
-            let backup_dir = workdir
-                .parent()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Cannot determine parent directory for working directory")
-                })?
-                .join(format!(
-                    "{}_old_backup",
-                    workdir
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("workdir")
-                ));
-
-            // Clean up old backup if it exists
-            if backup_dir.exists() {
-                debug!("Cleaning up old backup directory");
-                fs::remove_dir_all(&backup_dir)?;
-            }
-
-            // Move current workdir to backup location
-            debug!("Moving current working directory to backup location");
-            fs::rename(workdir, &backup_dir)?;
-
-            // Move temp directory to workdir location
-            debug!("Moving temporary directory to working directory location");
-            match fs::rename(&temp_dir, workdir) {
-                Ok(_) => {
-                    debug!("Restore completed successfully, cleaning up old backup");
-                    // Only remove the old backup if the restore succeeded
-                    let _ = fs::remove_dir_all(&backup_dir);
-                }
-                Err(e) => {
-                    // If rename fails, try to restore the original
-                    error!("Failed to move temp directory: {}", e);
-                    debug!("Attempting to restore original working directory");
-                    if let Err(_restore_err) = fs::rename(&backup_dir, workdir) {
-                        error!("Failed to restore original directory: {}", _restore_err);
-                        return Err(anyhow::anyhow!(
-                            "Restore failed and could not recover original directory. Original backed up at: {:?}",
-                            backup_dir
-                        ));
-                    }
-                    return Err(anyhow::anyhow!("Failed to complete restore: {}", e));
-                }
-            }
+            debug!("Checkout completed successfully");
         } else {
             warn!("No working directory configured for repository");
             // For bare repositories, just update HEAD
@@ -1164,6 +1091,131 @@ impl BackupManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Purges a specific commit by its ID from the repository.
+    ///
+    /// This function removes a commit from the repository's history by rewriting
+    /// the commit chain to exclude the specified commit. All descendant commits
+    /// are rewritten to maintain history continuity, and garbage collection is
+    /// performed to reclaim disk space.
+    ///
+    /// # Arguments
+    ///
+    /// * `commit_id` - A string-like identifier of the commit to purge.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Returns `Ok(())` if the commit was successfully purged,
+    ///                  or an error if the operation fails.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if:
+    /// * The commit ID is invalid or the commit cannot be found
+    /// * The commit is not part of the current branch's history
+    /// * Attempting to delete the only commit in the repository
+    /// * File system or Git operations fail during rewriting or cleanup
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use obsidian_backup_system::BackupManager;
+    ///
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    ///
+    /// let commit_id = "abcd1234567890";
+    /// manager.purge_commit(commit_id)
+    ///     .expect("Failed to purge commit");
+    /// ```
+    pub fn purge_commit(&self, commit_id: impl AsRef<str>) -> Result<()> {
+        let commit_id = commit_id.as_ref();
+        info!("Purging commit with ID: {}", commit_id);
+
+        // Validate the commit exists
+        let target_oid = Oid::from_str(commit_id)?;
+        let target_commit = self.repository.find_commit(target_oid)?;
+
+        // Get all commits in the current branch
+        let all_ids = self.list_ids()?;
+
+        // Find the position of the target commit
+        let target_position = all_ids
+            .iter()
+            .position(|id| id == commit_id)
+            .ok_or_else(|| anyhow::anyhow!("Commit {} is not in the current branch history", commit_id))?;
+
+        debug!("Target commit found at position {}", target_position);
+
+        // Cannot delete if it's the only commit
+        if all_ids.len() == 1 {
+            return Err(anyhow::anyhow!("Cannot purge the only commit in the repository"));
+        }
+
+        // Get the parent of the target commit (if it exists)
+        let parent_oid = if target_commit.parent_count() > 0 {
+            Some(target_commit.parent(0)?.id())
+        } else {
+            None
+        };
+
+        // If this is the most recent commit (HEAD)
+        if target_position == 0 {
+            debug!("Purging HEAD commit");
+
+            // Update HEAD to point to the parent
+            if let Some(parent_oid) = parent_oid {
+                self.repository.reference(
+                    "refs/heads/master",
+                    parent_oid,
+                    true,
+                    &format!("Purged commit {}", commit_id),
+                )?;
+                self.repository.set_head("refs/heads/master")?;
+            } else {
+                // No parent means this was the initial commit, and we're deleting it
+                // This leaves the repo empty, which we disallow above
+                return Err(anyhow::anyhow!("Cannot purge initial commit when it's the only commit"));
+            }
+        } else {
+            // Rewrite the commit chain, skipping the target commit
+            debug!("Rewriting commit chain to skip target commit");
+
+            // Get all commits that come after (descendants of) the target
+            let commits_to_rewrite = &all_ids[..target_position];
+
+            // Determine the new parent for the rewrite
+            let new_parent_oid = if let Some(parent_oid) = parent_oid {
+                parent_oid
+            } else {
+                // If the target has no parent, we need to make the next commit the new root
+                let next_commit_id = &all_ids[target_position + 1];
+                let next_oid = Oid::from_str(next_commit_id)?;
+                let next_commit = self.repository.find_commit(next_oid)?;
+
+                // Create a new root commit with the same tree as the next commit
+                let sig = self.repository.signature()?;
+                self.repository.commit(
+                    None,
+                    &next_commit.author(),
+                    &next_commit.committer(),
+                    next_commit.message().unwrap_or("No description provided"),
+                    &next_commit.tree()?,
+                    &[],
+                )?
+            };
+
+            // Rewrite all descendant commits
+            self.rewrite_commit_chain(commits_to_rewrite, new_parent_oid)?;
+        }
+
+        // Run garbage collection to reclaim space
+        debug!("Running garbage collection");
+        self.cleanup_orphaned_commits()?;
+
+        info!("Successfully purged commit {}", commit_id);
         Ok(())
     }
 
