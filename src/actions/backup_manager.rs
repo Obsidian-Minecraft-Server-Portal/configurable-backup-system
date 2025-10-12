@@ -1742,4 +1742,155 @@ impl BackupManager {
         visit_dirs(repo_path, &mut total_size)?;
         Ok(total_size)
     }
+
+    /// Exports a backup identified by its ID into a compressed ZIP archive stream (async).
+    ///
+    /// This function retrieves a backup commit from the Git repository using the provided `backup_id`,
+    /// packages its content into a compressed ZIP archive, and streams the result to the provided async writer.
+    /// This is designed for use with async I/O systems like Tokio, enabling efficient streaming of large
+    /// backups without loading them entirely into memory.
+    ///
+    /// # Parameters
+    ///
+    /// * `backup_id` - A string-like identifier of the backup to export. This must correspond to a valid Git object ID (OID) in the repository.
+    /// * `writer` - An async writer implementing `AsyncWrite` where the ZIP archive will be streamed to.
+    /// * `level` - Compression level (0-9, clamped to this range). The value determines the trade-off between compression size and speed.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Returns `Ok(())` if the archive is successfully created and streamed, or an error if any step in the process fails.
+    ///
+    /// # Errors
+    ///
+    /// This function can fail for several reasons, including (but not limited to):
+    ///
+    /// 1. The provided `backup_id` is not a valid Git OID.
+    /// 2. The backup commit or its associated tree cannot be found within the repository.
+    /// 3. Issues encountered while creating the archive writer or writing to the output stream.
+    /// 4. Any errors arising from compression settings or file operations during the archive creation process.
+    ///
+    /// # Logging
+    ///
+    /// - Logs the progress of the backup export process at `info` and `debug` levels.
+    /// - Logs errors if any step in the process fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use obsidian_backups::BackupManager;
+    /// use tokio::fs::File;
+    ///
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    ///
+    /// let last_backup = manager
+    ///     .last()
+    ///     .expect("Failed to get last backup")
+    ///     .expect("No backups found");
+    ///
+    /// // Export to an async file
+    /// let mut file = File::create("backup.zip").await.expect("Failed to create file");
+    /// manager.export_to_stream_async(&last_backup.id, &mut file, 6).await
+    ///     .expect("Failed to export backup to stream");
+    /// ```
+    ///
+    /// In this example, the specified backup ID is packed into a ZIP archive
+    /// with compression level 6 and streamed to the provided async writer.
+    #[cfg(feature = "async-stream")]
+    pub async fn export_to_stream_async<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        backup_id: impl AsRef<str>,
+        writer: W,
+        level: u8,
+    ) -> Result<()> {
+        use archflow::compress::tokio::archive::ZipArchive;
+
+        // Validate and clamp compression level to 0-9 range
+        let level = level.clamp(0, 9);
+
+        let backup_id = backup_id.as_ref();
+        info!("Exporting backup with ID: {} to async stream", backup_id);
+
+        let oid = git2::Oid::from_str(backup_id)?;
+        let commit = self.repository.find_commit(oid)?;
+        let tree = commit.tree()?;
+
+        // Create ZIP archive with streaming support
+        let mut archive = ZipArchive::new_streamable(writer);
+
+        // Set compression method
+        let compression_type: archflow::compression::CompressionMethod = match level {
+            0 => archflow::compression::CompressionMethod::Store(),
+            _ => archflow::compression::CompressionMethod::Deflate(),
+        };
+
+        // Walk the tree recursively and add files to the archive
+        self.add_tree_to_zip_archive_async(&mut archive, &tree, "", compression_type)
+            .await?;
+
+        debug!("Finalizing archive stream");
+        archive.finalize().await.map_err(|e| anyhow!("Failed to finalize archive: {}", e))?;
+
+        info!("Archive stream created successfully");
+        Ok(())
+    }
+
+    /// Helper method to recursively add files from a git tree to a ZIP archive (async)
+    #[cfg(feature = "async-stream")]
+    async fn add_tree_to_zip_archive_async<W: tokio::io::AsyncWrite + Unpin + Send>(
+        &self,
+        archive: &mut archflow::compress::tokio::archive::ZipArchive<'_, W>,
+        tree: &git2::Tree<'_>,
+        path_prefix: &str,
+        compress_method: archflow::compression::CompressionMethod,
+    ) -> Result<()> {
+        use archflow::compress::FileOptions;
+
+        for entry in tree.iter() {
+            let name = entry.name().unwrap_or("");
+            let full_path = if path_prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}/{}", path_prefix, name)
+            };
+
+            match entry.kind() {
+                Some(git2::ObjectType::Blob) => {
+                    // It's a file
+                    debug!("Adding file to archive: {}", full_path);
+                    let blob = self.repository.find_blob(entry.id())?;
+                    let content = blob.content();
+
+                    // Create file options with compression method
+                    let options = FileOptions::default().compression_method(compress_method);
+
+                    // Create a cursor for the content
+                    let mut cursor = std::io::Cursor::new(content);
+
+                    // Append file to the archive
+                    archive
+                        .append(&full_path, &options, &mut cursor)
+                        .await
+                        .map_err(|e| anyhow!("Failed to append file to archive: {}", e))?;
+                }
+                Some(git2::ObjectType::Tree) => {
+                    // It's a directory, recurse into it
+                    debug!("Entering directory: {}", full_path);
+                    let subtree = self.repository.find_tree(entry.id())?;
+                    Box::pin(self.add_tree_to_zip_archive_async(
+                        archive,
+                        &subtree,
+                        &full_path,
+                        compress_method,
+                    ))
+                    .await?;
+                }
+                _ => {
+                    // Skip other object types (commits, tags, etc.)
+                    debug!("Skipping object type: {:?} for {}", entry.kind(), full_path);
+                }
+            }
+        }
+        Ok(())
+    }
 }
