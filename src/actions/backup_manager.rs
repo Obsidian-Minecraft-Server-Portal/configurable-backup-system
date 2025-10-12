@@ -161,6 +161,7 @@ impl BackupManager {
 
         let mut opts = RepositoryInitOptions::new();
         opts.workdir_path(&working_directory);
+        opts.no_dotgit_dir(true);
 
         debug!("Initializing git repository with options");
         let repository = Repository::init_opts(&store_directory, &opts)?;
@@ -233,7 +234,7 @@ impl BackupManager {
             let commit = self.repository.find_commit(Oid::from_str(&commit_id)?)?;
             let item = BackupItem {
                 id: commit_id,
-                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
+                timestamp: chrono::DateTime::from_timestamp(commit.time().seconds(), 0)
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
                 description: commit
                     .message()
@@ -884,7 +885,7 @@ impl BackupManager {
             let commit = self.repository.find_commit(oid)?;
             let item = BackupItem {
                 id: oid.to_string(),
-                timestamp: chrono::DateTime::from_timestamp_secs(commit.time().seconds())
+                timestamp: chrono::DateTime::from_timestamp(commit.time().seconds(), 0)
                     .unwrap_or(chrono::DateTime::<chrono::Utc>::MIN_UTC),
                 description: commit
                     .message()

@@ -1,6 +1,6 @@
 [package]
 name = "obsidian-backups"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A Git-based backup library for Rust applications. Originally designed for the Obsidian Minecraft Server Panel, but generic enough to be used in any project requiring file backup management. "
 authors = ["Drew Chase"]
