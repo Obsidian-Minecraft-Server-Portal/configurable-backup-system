@@ -13,6 +13,7 @@ This library uses Git under the hood to provide efficient, version-controlled ba
 - 📦 **Export backups** - Create compressed archives (7z) from any backup (requires `zip` feature)
 - 🏷️ **Backup descriptions** - Add meaningful descriptions to track what each backup represents
 - ⚡ **Efficient storage** - Leverages Git's delta compression for space-efficient storage
+- 🗑️ **Backup retention** - Automatically purge old backups by count, age, or repository size
 - 🔧 **Optional features** - Enable only the functionality you need
 - 🛡️ **Smart exclusions** - Automatically excludes system files (.git, .DS_Store, temp files, etc.)
 
@@ -152,6 +153,73 @@ for file in modified_files {
 
 **Note:** Compression levels are automatically validated and clamped to the valid range (0-9). Values below 0 become 0, and values above 9 become 9.
 
+### Purge Old Backups
+
+The backup system provides three strategies for managing backup retention and preventing unlimited growth:
+
+#### 1. Purge by Count - Keep Only N Most Recent Backups
+
+```rust
+// Keep only the 10 most recent backups, remove all older ones
+manager.purge_backups_over_count(10)
+    .expect("Failed to purge old backups");
+```
+
+This method:
+- Keeps the specified number of most recent backups
+- Removes all older backups while maintaining Git repository integrity
+- Consolidates the oldest kept backup into a new base commit
+- Runs garbage collection to reclaim disk space
+
+#### 2. Purge by Age - Remove Backups Older Than a Time Period
+
+```rust
+use chrono::Duration;
+
+// Remove backups older than 30 days
+manager.purge_backups_older_than(Duration::days(30))
+    .expect("Failed to purge old backups");
+
+// Remove backups older than 7 days
+manager.purge_backups_older_than(Duration::days(7))
+    .expect("Failed to purge old backups");
+
+// Remove backups older than 2 hours
+manager.purge_backups_older_than(Duration::hours(2))
+    .expect("Failed to purge old backups");
+```
+
+This method:
+- Removes all backups created before the specified time period
+- Preserves all backups within the time window
+- Creates a consolidated base commit from the oldest kept backup
+- Automatically runs cleanup to free disk space
+
+#### 3. Purge by Size - Keep Repository Under a Size Limit
+
+```rust
+// Keep repository under 100MB
+manager.purge_backups_over_size(100 * 1024 * 1024)
+    .expect("Failed to reduce repository size");
+
+// Keep repository under 1GB
+manager.purge_backups_over_size(1024 * 1024 * 1024)
+    .expect("Failed to reduce repository size");
+```
+
+This method:
+- Removes oldest backups until repository size is below the threshold
+- Uses a binary search approach to efficiently find the right number of backups to keep
+- Requires at least one backup to remain
+- Returns an error if size cannot be reduced without removing all backups
+
+**Important Notes:**
+- All purge operations maintain repository integrity through Git's commit rewriting
+- Purging is permanent and cannot be undone - removed backups are deleted
+- At least one backup must remain after purging
+- Automatic garbage collection runs after purging to reclaim disk space
+- Purge operations may take time on large repositories due to rewriting commit history
+
 ## Complete Example
 
 ```rust
@@ -197,6 +265,53 @@ fn main() -> anyhow::Result<()> {
 	println!("\nRestored to initial state");
 
 	Ok(())
+}
+```
+
+## Backup Retention Example
+
+```rust
+use obsidian_backups::BackupManager;
+use chrono::Duration;
+use std::fs;
+
+fn main() -> anyhow::Result<()> {
+    // Initialize backup manager
+    let manager = BackupManager::new("./backups", "./my_data")?;
+
+    // Create multiple backups over time
+    fs::write("./my_data/file.txt", "Version 1")?;
+    manager.backup(Some("Version 1".to_string()))?;
+
+    fs::write("./my_data/file.txt", "Version 2")?;
+    manager.backup(Some("Version 2".to_string()))?;
+
+    fs::write("./my_data/file.txt", "Version 3")?;
+    manager.backup(Some("Version 3".to_string()))?;
+
+    // List all backups before purging
+    let backups_before = manager.list()?;
+    println!("Backups before purge: {}", backups_before.len());
+
+    // Strategy 1: Keep only the 2 most recent backups
+    manager.purge_backups_over_count(2)?;
+    println!("Kept only 2 most recent backups");
+
+    // Strategy 2: Remove backups older than 7 days
+    // manager.purge_backups_older_than(Duration::days(7))?;
+
+    // Strategy 3: Keep repository under 50MB
+    // manager.purge_backups_over_size(50 * 1024 * 1024)?;
+
+    // List backups after purging
+    let backups_after = manager.list()?;
+    println!("Backups after purge: {}", backups_after.len());
+
+    for backup in backups_after {
+        println!("  {}: {}", backup.timestamp, backup.description);
+    }
+
+    Ok(())
 }
 ```
 
@@ -469,6 +584,9 @@ The main struct for managing backups.
 - `restore(backup_id: impl AsRef<str>) -> Result<()>` - Restore a specific backup
 - `diff(backup_id: impl AsRef<str>) -> Result<Vec<ModifiedFile>>` - Get changes in a backup
 - `export(backup_id, output_path, level: u8) -> Result<()>` - Export backup as 7z archive (requires `zip` feature)
+- `purge_backups_over_count(count: usize) -> Result<()>` - Keep only the N most recent backups, remove older ones
+- `purge_backups_older_than(period: chrono::Duration) -> Result<()>` - Remove backups older than specified duration
+- `purge_backups_over_size(size: usize) -> Result<()>` - Remove old backups to keep repository under size limit (in bytes)
 
 ### `BackupItem`
 
