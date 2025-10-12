@@ -552,6 +552,127 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "zip")]
+    fn test_export_to_stream() {
+        use std::io::Cursor;
+
+        let (store_dir, working_dir) = setup_test_env("export_stream");
+
+        create_test_file(&working_dir, "test.txt", b"Content to export to stream");
+        create_test_file(&working_dir, "file2.txt", b"Second file");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let backup_id = manager
+            .backup(Some("Stream export test".to_string()))
+            .expect("Failed to create backup");
+
+        // Export to in-memory buffer
+        let mut buffer = Cursor::new(Vec::new());
+        let result = manager.export_to_stream(&backup_id, &mut buffer, 5);
+        assert!(result.is_ok(), "Failed to export backup to stream");
+
+        // Verify the buffer contains data
+        let archive_bytes = buffer.into_inner();
+        assert!(!archive_bytes.is_empty(), "Archive should not be empty");
+        assert!(
+            archive_bytes.len() > 100,
+            "Archive should contain compressed data"
+        );
+
+        // Verify the 7z signature (starts with "7z")
+        assert_eq!(
+            &archive_bytes[0..2],
+            &[0x37, 0x7A],
+            "Should have 7z file signature"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "zip")]
+    fn test_export_to_stream_with_subdirectories() {
+        use std::io::Cursor;
+
+        let (store_dir, working_dir) = setup_test_env("export_stream_subdirs");
+
+        let subdir = working_dir.join("subdir");
+        fs::create_dir_all(&subdir).expect("Failed to create subdirectory");
+
+        create_test_file(&working_dir, "root.txt", b"Root content");
+        create_test_file(&subdir, "nested.txt", b"Nested content");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let backup_id = manager
+            .backup(Some("Stream export with subdirs".to_string()))
+            .expect("Failed to create backup");
+
+        // Export to in-memory buffer
+        let mut buffer = Cursor::new(Vec::new());
+        let result = manager.export_to_stream(&backup_id, &mut buffer, 9);
+        assert!(result.is_ok(), "Failed to export backup to stream");
+
+        let archive_bytes = buffer.into_inner();
+        assert!(!archive_bytes.is_empty(), "Archive should contain data");
+    }
+
+    #[test]
+    #[cfg(feature = "zip")]
+    fn test_export_to_stream_compression_levels() {
+        use std::io::Cursor;
+
+        let (store_dir, working_dir) = setup_test_env("export_stream_levels");
+
+        create_test_file(&working_dir, "test.txt", b"A".repeat(10000).as_slice());
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let backup_id = manager
+            .backup(Some("Compression test".to_string()))
+            .expect("Failed to create backup");
+
+        // Test minimum compression
+        let mut buffer_min = Cursor::new(Vec::new());
+        manager
+            .export_to_stream(&backup_id, &mut buffer_min, 0)
+            .expect("Failed with level 0");
+        let size_min = buffer_min.into_inner().len();
+
+        // Test maximum compression
+        let mut buffer_max = Cursor::new(Vec::new());
+        manager
+            .export_to_stream(&backup_id, &mut buffer_max, 9)
+            .expect("Failed with level 9");
+        let size_max = buffer_max.into_inner().len();
+
+        // Maximum compression should generally produce smaller files
+        // but we can't guarantee it for all data, so just verify both succeed
+        assert!(size_min > 0, "Minimum compression should produce data");
+        assert!(size_max > 0, "Maximum compression should produce data");
+    }
+
+    #[test]
+    #[cfg(feature = "zip")]
+    fn test_export_to_stream_invalid_backup_id() {
+        use std::io::Cursor;
+
+        let (store_dir, working_dir) = setup_test_env("export_stream_invalid");
+
+        let manager =
+            BackupManager::new(&store_dir, &working_dir).expect("Failed to create BackupManager");
+
+        let mut buffer = Cursor::new(Vec::new());
+        let result = manager.export_to_stream("invalid_id_123", &mut buffer, 5);
+        assert!(
+            result.is_err(),
+            "Should fail to export with invalid backup ID"
+        );
+    }
+
+    #[test]
     fn test_diff_nested_directories() {
         let (store_dir, working_dir) = setup_test_env("diff_nested");
 

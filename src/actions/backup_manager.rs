@@ -753,6 +753,93 @@ impl BackupManager {
         Ok(())
     }
 
+    /// Exports a backup identified by its ID into a compressed archive stream.
+    ///
+    /// This function retrieves a backup commit from the Git repository using the provided `backup_id`,
+    /// packages its content into a compressed archive, and writes the result to the provided writer stream.
+    /// This is useful for scenarios where you want to stream the archive directly to an in-memory buffer,
+    /// or any other seekable destination without creating an intermediate file.
+    ///
+    /// # Parameters
+    ///
+    /// * `backup_id` - A string-like identifier of the backup to export. This must correspond to a valid Git object ID (OID) in the repository.
+    /// * `writer` - A writer implementing both `Write` and `Seek` where the archive will be written to. The 7z format requires seeking to write headers and metadata.
+    /// * `level` - Compression level (0-9, clamped to this range). The value determines the trade-off between compression size and speed.
+    ///
+    /// # Returns
+    ///
+    /// * `Result<()>` - Returns `Ok(())` if the archive is successfully created and written to the stream, or an error if any step in the process fails.
+    ///
+    /// # Errors
+    ///
+    /// This function can fail for several reasons, including (but not limited to):
+    ///
+    /// 1. The provided `backup_id` is not a valid Git OID.
+    /// 2. The backup commit or its associated tree cannot be found within the repository.
+    /// 3. Issues encountered while creating the archive writer or writing to the output stream.
+    /// 4. Any errors arising from compression settings or file operations during the archive creation process.
+    ///
+    /// # Logging
+    ///
+    /// - Logs the progress of the backup export process at `info` and `debug` levels.
+    /// - Logs errors if any step in the process fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use obsidian_backup_system::BackupManager;
+    /// use std::io::Cursor;
+    ///
+    /// let manager = BackupManager::new("./backup_store", "./my_data")
+    ///     .expect("Failed to initialize BackupManager");
+    ///
+    /// let last_backup = manager
+    ///     .last()
+    ///     .expect("Failed to get last backup")
+    ///     .expect("No backups found");
+    ///
+    /// // Export to an in-memory buffer
+    /// let mut buffer = Cursor::new(Vec::new());
+    /// manager.export_to_stream(&last_backup.id, &mut buffer, 5)
+    ///     .expect("Failed to export backup to stream");
+    ///
+    /// let archive_bytes = buffer.into_inner();
+    /// println!("Archive size: {} bytes", archive_bytes.len());
+    /// ```
+    ///
+    /// In this example, the specified backup ID is packed into a `.7z` archive
+    /// with medium compression level (5) and written to the provided stream.
+    #[cfg(feature = "zip")]
+    pub fn export_to_stream<W: std::io::Write + std::io::Seek>(
+        &self,
+        backup_id: impl AsRef<str>,
+        writer: W,
+        level: u8,
+    ) -> Result<()> {
+        // Validate and clamp compression level to 0-9 range
+        let level = level.clamp(0, 9);
+
+        let mut archive_writer = ArchiveWriter::new(writer)?;
+        archive_writer.set_content_methods(vec![
+            encoder_options::Lzma2Options::from_level(level as u32).into(),
+        ]);
+
+        let backup_id = backup_id.as_ref();
+        info!("Exporting backup with ID: {} to stream", backup_id);
+        let oid = Oid::from_str(backup_id)?;
+        let commit = self.repository.find_commit(oid)?;
+        let tree = commit.tree()?;
+
+        // Walk the tree recursively and add files to the archive
+        self.add_tree_to_archive(&mut archive_writer, &tree, "")?;
+
+        debug!("Finalizing archive stream");
+        archive_writer.finish()?;
+
+        info!("Archive stream created successfully");
+        Ok(())
+    }
+
     /// Computes the list of files that were modified (added, updated, or deleted)
     /// in the specified backup/commit within the repository.
     ///
@@ -1039,9 +1126,9 @@ impl BackupManager {
     }
 
     #[cfg(feature = "zip")]
-    fn add_tree_to_archive(
+    fn add_tree_to_archive<W: std::io::Write + std::io::Seek>(
         &self,
-        writer: &mut ArchiveWriter<fs::File>,
+        writer: &mut ArchiveWriter<W>,
         tree: &git2::Tree,
         path_prefix: &str,
     ) -> Result<()> {
